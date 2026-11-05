@@ -1,0 +1,344 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bpereira <bpereira@cloudflare.com>
+Date: Tue, 3 Nov 2026 08:40:35 +0000
+Subject: [PATCH] Rasterize recorded scenes in bounded row bands
+
+Allow a destination pixmap to start at an aligned scene row, so a caller can render a
+recorded scene band by band without allocating its full pixel buffer. Glyph resources are
+prepared once and kept with the recorded context until every band is rendered.
+---
+ src/dispatch/multi_threaded.rs  |   2 +
+ src/dispatch/single_threaded.rs |   3 +
+ src/fine/mod.rs                 |   2 +
+ src/lib.rs                      |   3 +-
+ src/region.rs                   |  14 +++-
+ src/render.rs                   | 132 +++++++++++++++++++++++++++++---
+ 6 files changed, 142 insertions(+), 14 deletions(-)
+
+diff --git a/src/dispatch/multi_threaded.rs b/src/dispatch/multi_threaded.rs
+index 3a7803b..b5a4d6e 100644
+--- a/src/dispatch/multi_threaded.rs
++++ b/src/dispatch/multi_threaded.rs
+@@ -421,12 +421,14 @@ impl MultiThreadedDispatcher {
+             let params = FineRenderParams {
+                 scene_size: (scene_width, scene_height),
+                 target_offset: settings.offset,
++                source_y: settings.source_y,
+             };
+
+             let mut regions = Regions::new(
+                 &mut target,
+                 params.scene_size,
+                 params.target_offset,
++                params.source_y,
+                 bucketer.rows().len(),
+             );
+             let fines = ThreadLocal::new();
+diff --git a/src/dispatch/single_threaded.rs b/src/dispatch/single_threaded.rs
+index 01d803d..e9d4d50 100644
+--- a/src/dispatch/single_threaded.rs
++++ b/src/dispatch/single_threaded.rs
+@@ -115,6 +115,7 @@ impl SingleThreadedDispatcher {
+         let params = FineRenderParams {
+             scene_size: (scene_width, scene_height),
+             target_offset: settings.offset,
++            source_y: settings.source_y,
+         };
+
+         self.bucket_and_rasterize::<S, F>(
+@@ -166,6 +167,7 @@ impl SingleThreadedDispatcher {
+             &mut target,
+             params.scene_size,
+             params.target_offset,
++            params.source_y,
+             bucketer.rows().len(),
+         );
+         Self::rasterize_target::<S, F>(
+@@ -250,6 +252,7 @@ impl SingleThreadedDispatcher {
+             let params = FineRenderParams {
+                 scene_size: (width, height),
+                 target_offset: (0, 0),
++                source_y: 0,
+             };
+
+             self.bucket_and_rasterize::<S, F>(
+diff --git a/src/fine/mod.rs b/src/fine/mod.rs
+index 92c5d4b..ce0785d 100644
+--- a/src/fine/mod.rs
++++ b/src/fine/mod.rs
+@@ -1180,6 +1180,8 @@ pub(crate) struct FineRenderParams {
+     pub(crate) scene_size: (u16, u16),
+     /// Destination offset in the target pixmap.
+     pub(crate) target_offset: (u16, u16),
++    /// First scene row to rasterize.
++    pub(crate) source_y: u16,
+ }
+
+ /// A trait for objects that can render pixel data into buffers.
+diff --git a/src/lib.rs b/src/lib.rs
+index 72c966d..6a71325 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -188,7 +188,8 @@ pub mod region;
+ pub mod span;
+
+ pub use render::{
+-    PixelFormat, RasterizerSettings, RenderContext, RenderSettings, Resources, TargetInit,
++    PixelFormat, PreparedRender, RasterizerSettings, RenderContext, RenderSettings, Resources,
++    TargetInit,
+ };
+ // Note: The first one is not something that should be
+ // exposed, but is currently needed by vello_tests.
+diff --git a/src/region.rs b/src/region.rs
+index adf7ff8..9edf215 100644
+--- a/src/region.rs
++++ b/src/region.rs
+@@ -120,13 +120,16 @@ impl<'a> Regions<'a> {
+         target: &'a mut PixmapMut<'_>,
+         scene_size: (u16, u16),
+         offset: (u16, u16),
++        source_y: u16,
+         row_count: usize,
+     ) -> Self {
+         let (dst_x, dst_y) = offset;
+
+         let (scene_width, scene_height) = scene_size;
+         let width = scene_width.min(target.width().saturating_sub(dst_x));
+-        let height = scene_height.min(target.height().saturating_sub(dst_y));
++        let height = scene_height
++            .saturating_sub(source_y)
++            .min(target.height().saturating_sub(dst_y));
+
+         if width == 0 || height == 0 {
+             return Self {
+@@ -134,7 +137,10 @@ impl<'a> Regions<'a> {
+             };
+         }
+
+-        let row_count = row_count.min(usize::from(height).div_ceil(Tile::HEIGHT as usize));
++        let first_row = usize::from(source_y / Tile::HEIGHT);
++        let row_count = row_count
++            .saturating_sub(first_row)
++            .min(usize::from(height).div_ceil(Tile::HEIGHT as usize));
+         let stride = usize::from(target.width()) * COLOR_COMPONENTS;
+         let x_offset = usize::from(dst_x) * COLOR_COMPONENTS;
+         let render_bytes = usize::from(height) * stride;
+@@ -148,7 +154,7 @@ impl<'a> Regions<'a> {
+             let band_len = usize::from(row_height) * stride;
+             let (buffer, rest) = remaining.split_at_mut(band_len);
+             regions.push(Region::from_rows(
+-                row_idx, width, row_height, stride, x_offset, buffer,
++                first_row + row_idx, width, row_height, stride, x_offset, buffer,
+             ));
+             remaining = rest;
+         }
+@@ -178,7 +184,7 @@ mod tests {
+         for offset in [(20, 0), (0, 20)] {
+             let mut pixmap = Pixmap::new(10, 10);
+             let mut pixmap = pixmap.as_mut();
+-            let _regions = Regions::new(&mut pixmap, (4, 4), offset, 1);
++            let _regions = Regions::new(&mut pixmap, (4, 4), offset, 0, 1);
+         }
+     }
+ }
+diff --git a/src/render.rs b/src/render.rs
+index ef6f07a..55f89ec 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -32,6 +32,7 @@ use vello_common::peniko::color::palette::css::BLACK;
+ use vello_common::peniko::{BlendMode, Fill};
+ use vello_common::pixmap::{Pixmap, PixmapMut};
+ use vello_common::render_state::RenderState;
++use vello_common::tile::Tile;
+ use vello_common::transforms::{RootTransforms, Transforms};
+ use vello_common::util::into_fast_path_rect;
+
+@@ -90,6 +91,46 @@ impl Resources {
+     }
+ }
+
++/// A recorded scene and its resources, kept alive while multiple regions are rasterized.
++#[derive(Debug)]
++pub struct PreparedRender {
++    context: RenderContext,
++    resources: Resources,
++    render_mode: RenderMode,
++}
++
++impl PreparedRender {
++    /// Consume a recorded scene and prepare its resources once for all regions.
++    pub fn new(
++        mut context: RenderContext,
++        mut resources: Resources,
++        render_mode: RenderMode,
++    ) -> Self {
++        assert!(
++            !context.dispatcher.has_layers(),
++            "some layers haven't been popped yet"
++        );
++        context.flush();
++        resources.before_render(render_mode);
++        Self {
++            context,
++            resources,
++            render_mode,
++        }
++    }
++
++    /// Render a region without evicting resources referenced by the recorded scene.
++    pub fn render_with<'a>(
++        &self,
++        target: impl Into<PixmapMut<'a>>,
++        mut settings: RasterizerSettings,
++    ) {
++        settings.render_mode = self.render_mode;
++        self.context
++            .rasterize_prepared(target.into(), &self.resources, settings);
++    }
++}
++
+ /// How the destination pixmap is initialized before rendering.
+ pub type TargetInit = vello_common::TargetInit<AlphaColor<Srgb>>;
+
+@@ -122,6 +163,8 @@ pub struct RasterizerSettings {
+     ///
+     /// See [`RenderContext::render_with`] for more information.
+     pub offset: (u16, u16),
++    /// First scene row to rasterize; must be aligned to four pixels.
++    pub source_y: u16,
+ }
+
+ impl Default for RasterizerSettings {
+@@ -131,6 +174,7 @@ impl Default for RasterizerSettings {
+             target_init: TargetInit::Clear(AlphaColor::TRANSPARENT),
+             pixel_format: PixelFormat::Rgba8,
+             offset: (0, 0),
++            source_y: 0,
+         }
+     }
+ }
+@@ -846,6 +890,11 @@ impl RenderContext {
+         resources: &mut Resources,
+         settings: RasterizerSettings,
+     ) {
++        assert_eq!(
++            settings.source_y % Tile::HEIGHT,
++            0,
++            "source_y must be aligned to four pixels"
++        );
+         // TODO: Maybe we should move those checks into the dispatcher.
+         assert!(
+             !self.dispatcher.has_layers(),
+@@ -853,10 +902,25 @@ impl RenderContext {
+         );
+
+         resources.before_render(settings.render_mode);
+-        let mut target = target.into();
++        self.rasterize_prepared(target.into(), resources, settings);
++        // Cached glyphs may be evicted only after this rendering is complete.
++        resources.after_render();
++    }
++
++    fn rasterize_prepared(
++        &self,
++        mut target: PixmapMut<'_>,
++        resources: &Resources,
++        settings: RasterizerSettings,
++    ) {
++        assert_eq!(
++            settings.source_y % Tile::HEIGHT,
++            0,
++            "source_y must be aligned to four pixels"
++        );
+         let target_fully_covered = settings.offset == (0, 0)
+             && self.width >= target.width()
+-            && self.height >= target.height();
++            && self.height.saturating_sub(settings.source_y) >= target.height();
+         // If the scene covers the whole pixmap than packing will take care
+         // of clearing everything anyway, so no reason to clear it explicitly
+         // here.
+@@ -895,12 +959,6 @@ impl RenderContext {
+             &self.encoded_paints,
+             &resources.image_registry,
+         );
+-        // TODO: We need to figure something out here API-wise. At the moment, the user can
+-        // theoretically rasterize the same `RenderContext` multiple times without resetting in-between.
+-        // However, if glyph caching is enabled, this method call could now evict that were previously
+-        // assumed to exist in `RenderContext`, meaning that if the user rasterizes the same `RenderContext`
+-        // again without resetting it, some of the cached glyphs might be stale and not exist anymore.
+-        resources.after_render();
+     }
+
+     /// Return the width of the scene.
+@@ -1035,7 +1093,9 @@ impl ImageResolver for ImageRegistry {
+ mod tests {
+     #[cfg(feature = "text")]
+     use crate::peniko::{Blob, FontData};
+-    use crate::{RasterizerSettings, RenderContext, Resources, TargetInit};
++    use crate::{
++        PreparedRender, RasterizerSettings, RenderContext, RenderMode, Resources, TargetInit,
++    };
+     #[cfg(feature = "text")]
+     use alloc::sync::Arc;
+     use alloc::vec;
+@@ -1084,6 +1144,60 @@ mod tests {
+         ctx
+     }
+
++    #[test]
++    fn source_rows_match_full_frame() {
++        let (width, height) = (41u16, 37u16);
++        let mut ctx = RenderContext::new(width, height);
++        ctx.set_paint(RED);
++        ctx.fill_rect(&Rect::new(2.3, 3.7, 35.6, 30.2));
++        ctx.set_paint(BLUE);
++        ctx.fill_rect(&Rect::new(7.2, 12.1, 40.0, 36.4));
++        ctx.flush();
++        let mut resources = Resources::new();
++        let stride = usize::from(width) * 4;
++        let mut full = vec![0; stride * usize::from(height)];
++        ctx.render(
++            PixmapMut::new(width, height, &mut full).unwrap(),
++            &mut resources,
++        );
++        let mut joined = vec![0; full.len()];
++        for start in (0..height).step_by(8) {
++            let band_height = (height - start).min(8);
++            let offset = usize::from(start) * stride;
++            let end = offset + usize::from(band_height) * stride;
++            ctx.render_with(
++                PixmapMut::new(width, band_height, &mut joined[offset..end]).unwrap(),
++                &mut resources,
++                RasterizerSettings {
++                    source_y: start,
++                    ..Default::default()
++                },
++            );
++        }
++        let mut wrong_band = vec![0; 8 * stride];
++        ctx.render(
++            PixmapMut::new(width, 8, &mut wrong_band).unwrap(),
++            &mut resources,
++        );
++        assert_ne!(wrong_band, full[8 * stride..16 * stride]);
++        assert_eq!(joined, full);
++        let prepared = PreparedRender::new(ctx, resources, RenderMode::OptimizeSpeed);
++        joined.fill(0);
++        for start in (0..height).step_by(8) {
++            let band_height = (height - start).min(8);
++            let offset = usize::from(start) * stride;
++            let end = offset + usize::from(band_height) * stride;
++            prepared.render_with(
++                PixmapMut::new(width, band_height, &mut joined[offset..end]).unwrap(),
++                RasterizerSettings {
++                    source_y: start,
++                    ..Default::default()
++                },
++            );
++        }
++        assert_eq!(joined, full);
++    }
++
+     #[test]
+     fn clip_overflow() {
+         let mut ctx = RenderContext::new(100, 100);
