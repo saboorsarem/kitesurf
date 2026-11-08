@@ -209,7 +209,7 @@ export function sourceDoctypeOf(html: string): { markup: string; end: number } |
       code === 0x0b ||
       code === 0x0c ||
       code === 0x0d ||
-      (code > 0x7f && WHITESPACE.test(html[index]))
+      (code > 0x7f && WHITESPACE.test(html.charAt(index)))
     );
   };
   // The prolog before the doctype is whitespace and comments, and a comment
