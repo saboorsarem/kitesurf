@@ -134,6 +134,7 @@ import {
   SyncFunction,
   anchorHrefAttribute,
   findAnchorAncestor,
+  findAnchorViaSingleChild,
   findFocusableAncestor,
   findSvgAnchorAtPoint,
   packBoaResult,
@@ -2744,7 +2745,10 @@ function activateAnchorNavigation(
   clientX: number,
   clientY: number,
 ): AnchorNavigation | null {
-  const anchor = findAnchorAncestor(targetEl) || findSvgAnchorAtPoint(targetEl, clientX, clientY);
+  const anchor =
+    findAnchorAncestor(targetEl) ||
+    findAnchorViaSingleChild(targetEl, clientX, clientY) ||
+    findSvgAnchorAtPoint(targetEl, clientX, clientY);
   if (!anchor) return null;
   const rawHref = anchorHrefAttribute(anchor);
   if (typeof rawHref !== "string" || rawHref.length === 0) return null;
@@ -3277,8 +3281,7 @@ export class PageScript extends WorkerEntrypoint implements PageScriptSession {
       marker ? `<!--${marker}-->` : "",
       safeUrl,
     );
-    const hasScriptObservers =
-      startupScriptDescriptors.length > 0 || source.eventHandlerAttributes;
+    const hasScriptObservers = startupScriptDescriptors.length > 0 || source.eventHandlerAttributes;
     // Free the source before scripts and first layout so it does not count against the isolate
     // limit at the Wasm peak.
     releaseNavigateSource(source);
