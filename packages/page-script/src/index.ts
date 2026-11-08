@@ -5455,6 +5455,9 @@ function queryDomChildNodeLists(
   const lists: QueryDomResult<"childNodeLists">["lists"] = [];
   for (const id of ids) {
     if (typeof id !== "number") continue;
+    // Measure before serializing: a wide parent's child list can exceed the
+    // JSRPC reply cap. Skipping it degrades to the client requesting it itself.
+    if (pageState.dom.nodeSubtreeBudgetError(id, depth, pierce)) continue;
     // The children at `depth` are the node's own subtree one level deeper.
     const node = sanitizeCdpNodeTree(pageState.dom.nodeSubtree(id, depth, pierce));
     if (node) lists.push({ parentId: id, nodes: node.children ?? [] });
@@ -6528,17 +6531,14 @@ async function queryDomAccessibilityTree(
   const formState = queryDomFormState(pageState, "formStateSnapshot", {});
   const values =
     "values" in formState
-      ? formState.values?.map(
-          ([id, value]): [number, string | number[]] => [
-            id,
-            isWellFormedUtf16(value)
-              ? value
-              : Array.from({ length: value.length }, (_, index) => value.charCodeAt(index)),
-          ],
-        )
+      ? formState.values?.map(([id, value]): [number, string | number[]] => [
+          id,
+          isWellFormedUtf16(value)
+            ? value
+            : Array.from({ length: value.length }, (_, index) => value.charCodeAt(index)),
+        ])
       : undefined;
-  const serializedFormState =
-    values === undefined ? formState : { ...formState, values };
+  const serializedFormState = values === undefined ? formState : { ...formState, values };
   const start = pageState.dom.accessibilityStream(
     JSON.stringify({ ...queryArgs, visibility, ...serializedFormState }),
   );
