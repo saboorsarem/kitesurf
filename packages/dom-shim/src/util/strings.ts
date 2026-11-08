@@ -83,10 +83,6 @@ export function cssEscape(s: unknown): string {
   return String(s).replace(/[^a-zA-Z0-9_-]/g, (ch) => "\\" + ch);
 }
 
-export function isReservedGlobalName(name: string): boolean {
-  return Object.prototype.hasOwnProperty.call(globalThis, name);
-}
-
 // A thrown value's message, else the value as a string. Reads `message`
 // the way `(e as { message?: unknown })?.message` would, primitives
 // included.
