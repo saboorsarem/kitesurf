@@ -4,10 +4,7 @@
 
 import { describe, it, expect } from "vitest";
 import { handleDom } from "../src/cdp/dom.ts";
-import {
-  MAX_RETAINED_FALLBACK_HTML_CHARS,
-  releaseFallbackHtml,
-} from "../src/cdp/dom-release.ts";
+import { MAX_RETAINED_FALLBACK_HTML_CHARS, releaseFallbackHtml } from "../src/cdp/dom-release.ts";
 import type { DispatchCtx } from "../src/cdp/dispatch.ts";
 import type { TargetState } from "../src/cdp/types.ts";
 import type { PageScriptStub } from "../src/eval/page-script.ts";
