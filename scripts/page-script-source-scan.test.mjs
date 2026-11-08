@@ -17,13 +17,15 @@ runInNewContext(code, { exports, require: () => ({}) });
 const { sourceDoctypeOf } = exports;
 
 test("finds the leading doctype after whitespace and comments", () => {
-  assert.deepEqual(sourceDoctypeOf("<!doctype html>"), {
+  // `runInNewContext` gives the result the VM realm's prototypes, which
+  // `assert.deepEqual` from `node:assert/strict` rejects, so copy it here.
+  assert.deepEqual({ ...sourceDoctypeOf("<!doctype html>") }, {
     markup: "<!DOCTYPE html>",
     end: 15,
   });
-  assert.deepEqual(sourceDoctypeOf('  <!-- a -->\n<!DOCTYPE html PUBLIC "x">'), {
+  assert.deepEqual({ ...sourceDoctypeOf('  <!-- a -->\n<!DOCTYPE html PUBLIC "x">') }, {
     markup: '<!DOCTYPE html PUBLIC "x">',
-    end: 38,
+    end: 39,
   });
 });
 
@@ -47,4 +49,13 @@ test("a long comment prolog stays linear", () => {
   const start = Date.now();
   assert.equal(sourceDoctypeOf(html), null);
   assert.ok(Date.now() - start < 250, "the prolog scan must not backtrack exponentially");
+});
+
+test("many doctype candidates in one prolog stay linear", () => {
+  // Each candidate used to rescan the leading whitespace, which made this quadratic: 176k
+  // characters took over 700 ms.
+  const html = " ".repeat(16_000) + "x" + "<!doctype>".repeat(16_000);
+  const start = Date.now();
+  assert.equal(sourceDoctypeOf(html), null);
+  assert.ok(Date.now() - start < 250, "the prolog scan must not rescan the leading whitespace");
 });
