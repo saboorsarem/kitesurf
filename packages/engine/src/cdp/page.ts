@@ -1222,23 +1222,45 @@ export async function handlePage(
             : DEFAULT_IMAGE_QUALITY;
         const omitBackground = req.params?.omitBackground === true;
         const clip = req.params?.clip;
-        if (clip && clip.scale !== undefined && clip.scale !== 1) {
-          throw new Error("Page.captureScreenshot failed: clip.scale other than 1 is not supported");
+        // Rendering is in CSS pixels, so a clip scale is only meaningful when it
+        // cancels the emulated device pixel ratio. Playwright's `scale: "css"`
+        // sends exactly that (1 / deviceScaleFactor).
+        if (
+          clip &&
+          clip.scale !== undefined &&
+          clip.scale * (target.deviceScaleFactor || 1) !== 1
+        ) {
+          throw new Error(
+            "Page.captureScreenshot failed: clip.scale other than 1 is not supported",
+          );
         }
-        const validClip = clip && typeof clip.x === "number" && typeof clip.y === "number" &&
-          typeof clip.width === "number" && typeof clip.height === "number"
-          ? { x: clip.x, y: clip.y, width: clip.width, height: clip.height }
-          : null;
-        const metrics = !validClip && req.params?.captureBeyondViewport === true
-          ? await sessionOf(ctx, target).callIfLive.layoutMetrics({})
-          : null;
-        const effectiveClip = validClip ?? (metrics
+        const validClip =
+          clip &&
+          typeof clip.x === "number" &&
+          typeof clip.y === "number" &&
+          typeof clip.width === "number" &&
+          typeof clip.height === "number"
+            ? { x: clip.x, y: clip.y, width: clip.width, height: clip.height }
+            : null;
+        const metrics =
+          !validClip && req.params?.captureBeyondViewport === true
+            ? await sessionOf(ctx, target).callIfLive.layoutMetrics({})
+            : null;
+        const effectiveClip =
+          validClip ??
+          (metrics
             ? { x: 0, y: 0, width: metrics.contentWidth, height: metrics.contentHeight }
             : null);
-        const captureWidth = Math.ceil(effectiveClip?.width ?? target.viewportWidth ?? DEFAULT_VIEWPORT_WIDTH);
-        const captureHeight = Math.ceil(effectiveClip?.height ?? target.viewportHeight ?? DEFAULT_VIEWPORT_HEIGHT);
+        const captureWidth = Math.ceil(
+          effectiveClip?.width ?? target.viewportWidth ?? DEFAULT_VIEWPORT_WIDTH,
+        );
+        const captureHeight = Math.ceil(
+          effectiveClip?.height ?? target.viewportHeight ?? DEFAULT_VIEWPORT_HEIGHT,
+        );
         if (captureWidth > MAX_SCREENSHOT_DIMENSION || captureHeight > MAX_SCREENSHOT_DIMENSION) {
-          throw new Error(`Page.captureScreenshot failed: requested ${captureWidth}x${captureHeight} px exceeds the 65535 px per-side raster limit; capture a smaller clip`);
+          throw new Error(
+            `Page.captureScreenshot failed: requested ${captureWidth}x${captureHeight} px exceeds the 65535 px per-side raster limit; capture a smaller clip`,
+          );
         }
         if (
           format === "webp" &&
@@ -1329,7 +1351,9 @@ export async function handlePage(
           }
           if ("failed" in viaRenderer) {
             if (viaRenderer.failed.startsWith("encoded-limit:")) {
-              throw new Error(`Page.captureScreenshot failed: encoded image exceeds ${MAX_SCREENSHOT_ENCODED_BYTES} bytes (${captureWidth}x${captureHeight} px); capture a smaller clip, or use format "jpeg" with a lower quality`);
+              throw new Error(
+                `Page.captureScreenshot failed: encoded image exceeds ${MAX_SCREENSHOT_ENCODED_BYTES} bytes (${captureWidth}x${captureHeight} px); capture a smaller clip, or use format "jpeg" with a lower quality`,
+              );
             }
             throw new Error(`Page.captureScreenshot failed: ${viaRenderer.failed}`);
           }
