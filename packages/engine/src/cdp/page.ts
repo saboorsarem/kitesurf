@@ -808,7 +808,6 @@ export async function handlePage(
       if (url === "about:blank" || url === "") {
         const html = "<html><head></head><body></body></html>";
         target.html = html;
-      target.fallbackHtmlReleased = false;
         target.fallbackHtmlReleased = false;
         const blitzUrl = sanitizeBaseUrl(url);
         try {
@@ -1274,6 +1273,7 @@ export async function handlePage(
       const url = sanitizeBaseUrl(requestedUrl);
       target.url = url;
       target.html = html;
+      target.fallbackHtmlReleased = false;
       releaseTargetDom(target);
       target.docCsp = null;
       target.docCspReportOnly = null;
