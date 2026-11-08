@@ -637,12 +637,16 @@ export class PageRenderer extends WorkerEntrypoint<RendererEnv> implements PageR
     const isPartial = baseValid && recordReply?.partial === true && !!clip;
     let bytes: Uint8Array | null = null;
     const rasterStart = Date.now();
+    // Only a branch that writes the retained slot may advance its sequence; a
+    // limited full frame leaves the slot holding an older frame.
+    let retainsFrame = false;
     try {
       const toViewportPoint = (rect: { x: number; y: number }) => [
         Math.round((Number(rect.x) || 0) - scrollX),
         Math.round((Number(rect.y) || 0) - scrollY),
       ];
       if (isPartial && clip && recordReply?.shift) {
+        retainsFrame = true;
         const ok =
           rasterizer.shiftRetained(partialKey, recordReply.shift.x | 0, recordReply.shift.y | 0) &&
           [{ clip, scene }, ...patches].every((patch) => {
@@ -651,9 +655,11 @@ export class PageRenderer extends WorkerEntrypoint<RendererEnv> implements PageR
           });
         bytes = ok ? rasterizer.encodeRetained(format, quality, partialKey) : null;
       } else if (isPartial && clip) {
+        retainsFrame = true;
         const [x, y] = toViewportPoint(clip);
         bytes = rasterizer.rasterizePartial(scene, x, y, format, quality, partialKey);
       } else if (partialKey !== "" && opts.encodedLimit === undefined) {
+        retainsFrame = true;
         bytes = rasterizer.rasterizeAndRetain(
           scene,
           format,
@@ -662,9 +668,16 @@ export class PageRenderer extends WorkerEntrypoint<RendererEnv> implements PageR
           partialKey,
         );
       } else {
-        bytes = format === "png" || format === "jpeg"
-          ? rasterizer.rasterizeLimited(scene, format, quality, opts.omitBackground === true, opts.encodedLimit ?? 0xffffffff)
-          : rasterizer.rasterize(scene, format, quality, opts.omitBackground === true);
+        bytes =
+          format === "png" || format === "jpeg"
+            ? rasterizer.rasterizeLimited(
+                scene,
+                format,
+                quality,
+                opts.omitBackground === true,
+                opts.encodedLimit ?? 0xffffffff,
+              )
+            : rasterizer.rasterize(scene, format, quality, opts.omitBackground === true);
       }
     } catch {
       bytes = null;
@@ -680,7 +693,9 @@ export class PageRenderer extends WorkerEntrypoint<RendererEnv> implements PageR
         retainedImage = null;
       }
       return {
-        error: info.startsWith('{"error":"encoded-limit:') ? `encoded-limit:${info}` : `rasterize failed: ${info}`,
+        error: info.startsWith('{"error":"encoded-limit:')
+          ? `encoded-limit:${info}`
+          : `rasterize failed: ${info}`,
         stage: "raster",
         info,
         phases,
@@ -690,7 +705,7 @@ export class PageRenderer extends WorkerEntrypoint<RendererEnv> implements PageR
       };
     }
     if (partialKey !== "") {
-      const held = rasterizer.retainedFrameKey() === partialKey;
+      const held = retainsFrame && rasterizer.retainedFrameKey() === partialKey;
       retainedKey = held ? partialKey : "";
       retainedSeq = held ? seq : -1;
       retainedScene = held && !isPartial ? scene : null;
@@ -804,7 +819,12 @@ export class PageRenderer extends WorkerEntrypoint<RendererEnv> implements PageR
         const scene = await input.take(length);
         stage = "resources";
         const unresolved = await resolveResources(
-          () => rasterizer.missingResources(scene), port, fetchAsset, fetchImage, fetchFont, timed,
+          () => rasterizer.missingResources(scene),
+          port,
+          fetchAsset,
+          fetchImage,
+          fetchFont,
+          timed,
         );
         if (unresolved) return { ...unresolved, phases };
         stage = "raster";
