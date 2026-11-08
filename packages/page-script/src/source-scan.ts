@@ -173,13 +173,64 @@ export function scanSourceFonts(html: string): SourceFontScan {
   };
 }
 
+const DOCTYPE_PREFIX = "<!doctype";
+const WHITESPACE = /\s/;
+
 /** The leading doctype, normalised, and the UTF-16 offset just past it. */
 export function sourceDoctypeOf(html: string): { markup: string; end: number } | null {
-  const match = html.match(/^((?:\s|<!--[\s\S]*?-->)*)(<!doctype\b[^>]*>)/i);
-  const raw = match?.[2];
-  if (!raw) return null;
-  const prefix = match?.[1] ?? "";
-  const end = prefix.length + raw.length;
+  // Walk the prolog in one pass. A regex with a lazy comment body backtracks
+  // exponentially on a page that opens with many comments and no doctype, and
+  // this now runs in the engine isolate before the navigate RPC.
+  const isSpace = (index: number): boolean => {
+    const code = html.charCodeAt(index);
+    return (
+      code === 0x20 ||
+      code === 0x09 ||
+      code === 0x0a ||
+      code === 0x0b ||
+      code === 0x0c ||
+      code === 0x0d ||
+      (code > 0x7f && WHITESPACE.test(html[index]))
+    );
+  };
+  // The prolog before the doctype is whitespace and comments, and a comment
+  // body may contain anything (including another `-->`), so it is one comment
+  // from its opening `<!--` to the last `-->`, with whitespace around it.
+  const isProlog = (end: number): boolean => {
+    let start = 0;
+    while (start < end && isSpace(start)) start++;
+    if (start === end) return true;
+    if (!html.startsWith("<!--", start)) return false;
+    let last = end - 1;
+    while (last > start && isSpace(last)) last--;
+    return (
+      last - start >= 6 &&
+      html.charCodeAt(last) === 0x3e &&
+      html.charCodeAt(last - 1) === 0x2d &&
+      html.charCodeAt(last - 2) === 0x2d
+    );
+  };
+  const doctype = /<!doctype/gi;
+  let at = -1;
+  for (;;) {
+    const match = doctype.exec(html);
+    if (!match) return null;
+    const index = match.index;
+    // `\b` after "doctype": the next character must not be a word character.
+    const after = html.charCodeAt(index + DOCTYPE_PREFIX.length);
+    const wordChar =
+      after === 0x5f ||
+      (after >= 0x30 && after <= 0x39) ||
+      (after >= 0x41 && after <= 0x5a) ||
+      (after >= 0x61 && after <= 0x7a);
+    if (wordChar || !isProlog(index)) continue;
+    at = index;
+    break;
+  }
+  const close = html.indexOf(">", at);
+  if (close < 0) return null;
+  const raw = html.slice(at, close + 1);
+  const end = close + 1;
 
   const body = raw.slice("<!doctype".length, -1).trim();
   const parsed = body.match(
