@@ -204,13 +204,9 @@ export function sourceDoctypeOf(html: string): { markup: string; end: number } |
       (code > 0x7f && WHITESPACE.test(html.charAt(index)))
     );
   };
-  // The prolog before the doctype is whitespace and comments, and a comment
-  // body may contain anything (including another `-->`), so it is one comment
-  // from its opening `<!--` to the last `-->`, with whitespace around it.
-  //
-  // The first non-space of the whole source starts every candidate's prolog, so
-  // find it once: rescanning it per candidate made a source whose prolog is long
-  // whitespace followed by many `<!doctype` candidates quadratic.
+  // The prolog is whitespace and comments; a comment body may contain `-->`, so it runs from
+  // `<!--` to the last `-->`. `prologStart` is found once because rescanning it per candidate
+  // made a long whitespace prolog followed by many `<!doctype` candidates quadratic.
   let prologStart = 0;
   while (prologStart < html.length && isSpace(prologStart)) prologStart++;
   const isProlog = (end: number): boolean => {
