@@ -15,9 +15,7 @@ const MARKUP = `<div class="case" data-case="inline">aa <em style="font-family:K
 <div class="case" data-case="unrelated">WiWi <b>z</b></div>
 <span id="control" style="font:24px KsDeferMono">WiWi</span>`;
 
-test("a late webfont reflows the lines that use it and the lines around them", async ({
-  page,
-}) => {
+test("a late webfont reflows the lines that use it and the lines around them", async ({ page }) => {
   await page.goto(FIXTURE(`targeted-${Date.now()}`), { waitUntil: "domcontentloaded" });
   const fallback = await page.evaluate((markup) => {
     document.body.insertAdjacentHTML("beforeend", markup);

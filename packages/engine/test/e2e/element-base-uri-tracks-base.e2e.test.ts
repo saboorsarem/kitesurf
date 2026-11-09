@@ -6,10 +6,7 @@ import { expect, test } from "./harness";
 import { setContent } from "./set-content";
 
 test("element URLs follow <base href> changes, insertion and removal", async ({ page }) => {
-  await setContent(
-    page,
-    `<base href="https://one.example/dir/"><a id="a" href="x.html">x</a>`,
-  );
+  await setContent(page, `<base href="https://one.example/dir/"><a id="a" href="x.html">x</a>`);
 
   const hrefs = await page.evaluate(() => {
     const a = document.getElementById("a") as HTMLAnchorElement;

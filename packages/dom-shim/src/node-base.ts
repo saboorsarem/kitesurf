@@ -1934,8 +1934,7 @@ NodeBase.prototype.isDefaultNamespace = function (namespace: string | null): boo
 // The document's base URL: the first connected <base href> resolved against `fallback`. The
 // document's base epoch moves whenever that can change, so the lookup reruns only then (-1, a
 // borrowed document, always reruns).
-let baseURIState: { dom: DomHandle; epoch: number; fallback: string; value: string } | null =
-  null;
+let baseURIState: { dom: DomHandle; epoch: number; fallback: string; value: string } | null = null;
 export function documentBaseURI(fallback: string): string {
   const epoch = dom ? dom.baseEpoch() : -1;
   const s = baseURIState;
