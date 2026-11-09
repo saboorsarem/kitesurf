@@ -40,7 +40,9 @@ test("Accessibility reply budget rejects whole trees before output allocation", 
   try {
     await setParagraphs(controlSession, 25_000);
     const controlBefore = await peakLiveBytes(controlSession, true);
-    const control = (await controlSession.send("Accessibility.getFullAXTree")) as { nodes: unknown[] };
+    const control = (await controlSession.send("Accessibility.getFullAXTree")) as {
+      nodes: unknown[];
+    };
     const controlAfter = await peakLiveBytes(controlSession);
     expect(control.nodes.length).toBeGreaterThan(50_000);
     const controlGrowth = Math.max(0, controlAfter - controlBefore);

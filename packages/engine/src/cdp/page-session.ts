@@ -140,7 +140,9 @@ export async function accessibilityTreeResponse(
   if ("budgetError" in buffered) return buffered;
   const retry = await readAccessibilityTree(buffered);
   if (retry.complete) return new RawJsonResult(retry.pieces);
-  throw new Error(`${method}: PageScript stream ended after ${retry.filled} of ${retry.byteLength} bytes`);
+  throw new Error(
+    `${method}: PageScript stream ended after ${retry.filled} of ${retry.byteLength} bytes`,
+  );
 }
 
 async function readAccessibilityTree(

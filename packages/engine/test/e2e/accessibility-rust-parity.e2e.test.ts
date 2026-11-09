@@ -332,8 +332,7 @@ test("Rust accessibility JSON matches every accessibility method", async ({ page
     const hash = createHash("sha256").update(canonicalJson(result, frameId)).digest("hex");
     actualGoldens[goldenKey] = hash;
     if (!regenerate && expectedGoldens[goldenKey] !== hash) {
-      const preview =
-        actualJson.length > 2048 ? `${actualJson.slice(0, 2048)}…` : actualJson;
+      const preview = actualJson.length > 2048 ? `${actualJson.slice(0, 2048)}…` : actualJson;
       const mismatch = `key=${goldenKey}: golden SHA-256 expected ${expectedGoldens[goldenKey] ?? "missing"}, actual ${hash}; actual JSON=${preview}`;
       mismatches.push(mismatch);
       if (mismatches.length <= 10) console.error(mismatch);

@@ -708,9 +708,7 @@ async function pushNodePaths(
   // Ancestors come outermost-first, so keep the head: its first entry hangs off a parent the
   // client already has, and each later one is a child of the entry before it. A tail would start
   // at a parent that was sliced away, so the client could not place any of it.
-  const parents = ancestorIds
-    .filter((id) => !nodes.childrenSent(id))
-    .slice(0, MAX_PUSHED_PARENTS);
+  const parents = ancestorIds.filter((id) => !nodes.childrenSent(id)).slice(0, MAX_PUSHED_PARENTS);
   const byOwner = iframeFrameIdsByOwner(target);
   for (let at = 0; at < parents.length; at += PUSH_PARENTS_PER_READ) {
     const batch = parents.slice(at, at + PUSH_PARENTS_PER_READ);
