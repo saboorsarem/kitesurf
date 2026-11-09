@@ -6210,9 +6210,14 @@ async function queryDomRecordPdfScenes(
       () => sceneSource.nextPage(paint),
       () => {
         if (
-          state.dom !== paint || state.paintCacheHandle !== paint || cascadeSeq() !== paintRevision ||
-          state.paintViewportW !== viewportW || state.paintViewportH !== viewportH ||
-          state.currentMediaType !== media || state.scrollX !== scrollX || state.scrollY !== scrollY
+          state.dom !== paint ||
+          state.paintCacheHandle !== paint ||
+          cascadeSeq() !== paintRevision ||
+          state.paintViewportW !== viewportW ||
+          state.paintViewportH !== viewportH ||
+          state.currentMediaType !== media ||
+          state.scrollX !== scrollX ||
+          state.scrollY !== scrollY
         ) {
           throw new Error("PDF document changed during scene streaming");
         }

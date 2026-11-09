@@ -26,8 +26,18 @@ test("held OOPIF bitmaps apply in arrival order after the final release", async 
   });
   const releaseFirst = gate.hold();
   const releaseSecond = gate.hold();
-  const first = gate.deliver({ ownerBackendNodeId: 12, width: 1, height: 1, rgba: new Uint8Array(4) });
-  const second = gate.deliver({ ownerBackendNodeId: 13, width: 1, height: 1, rgba: new Uint8Array(4) });
+  const first = gate.deliver({
+    ownerBackendNodeId: 12,
+    width: 1,
+    height: 1,
+    rgba: new Uint8Array(4),
+  });
+  const second = gate.deliver({
+    ownerBackendNodeId: 13,
+    width: 1,
+    height: 1,
+    rgba: new Uint8Array(4),
+  });
 
   assert.deepEqual(applied, []);
   releaseFirst();

@@ -29,7 +29,9 @@ test("PDF streaming holds a stable snapshot and resumes page timers afterward", 
   page,
   cdpSession,
 }) => {
-  const paragraphs = Array.from({ length: 900 }, (_, index) => `<p>Print row ${index}</p>`).join("");
+  const paragraphs = Array.from({ length: 900 }, (_, index) => `<p>Print row ${index}</p>`).join(
+    "",
+  );
   await setContent(
     page,
     `<style>p { height: 32px; margin: 0 } body { color: red }</style><input value="alpha">${paragraphs}`,
@@ -60,11 +62,15 @@ test("PDF streaming holds a stable snapshot and resumes page timers afterward", 
 
   try {
     const duringInterval = await printResult(cdpSession);
-    const ticksAfterPrint = await page.evaluate(() => Number(Reflect.get(window, "__pdfStreamTicks")));
+    const ticksAfterPrint = await page.evaluate(() =>
+      Number(Reflect.get(window, "__pdfStreamTicks")),
+    );
     await expect
       .poll(() => page.evaluate(() => Number(Reflect.get(window, "__pdfStreamTicks"))))
       .toBeGreaterThan(ticksAfterPrint);
-    await page.evaluate(() => window.clearInterval(Number(Reflect.get(window, "__pdfStreamTimer"))));
+    await page.evaluate(() =>
+      window.clearInterval(Number(Reflect.get(window, "__pdfStreamTimer"))),
+    );
 
     await page.evaluate(() => {
       document.body.style.color = "red";
@@ -89,6 +95,8 @@ test("PDF streaming holds a stable snapshot and resumes page timers afterward", 
     }
     expect(exceptions).toEqual([]);
   } finally {
-    await page.evaluate(() => window.clearInterval(Number(Reflect.get(window, "__pdfStreamTimer"))));
+    await page.evaluate(() =>
+      window.clearInterval(Number(Reflect.get(window, "__pdfStreamTimer"))),
+    );
   }
 });

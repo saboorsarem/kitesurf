@@ -8,23 +8,29 @@ import test from "node:test";
 import { createContext, runInContext } from "node:vm";
 import ts from "typescript";
 
-const source = readFileSync(new URL("../packages/page-script/src/pdf-stream.ts", import.meta.url), "utf8");
+const source = readFileSync(
+  new URL("../packages/page-script/src/pdf-stream.ts", import.meta.url),
+  "utf8",
+);
 const code = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
 }).outputText;
 function loadPdfScenePages(schedule = setTimeout, clear = clearTimeout) {
   const exports = {};
-  runInContext(code, createContext({
-    exports,
-    ReadableStream,
-    Uint8Array,
-    DataView,
-    TextEncoder,
-    Error,
-    setTimeout: schedule,
-    clearTimeout: clear,
-    require: () => ({ nativeSetTimeout: schedule, nativeClearTimeout: clear }),
-  }));
+  runInContext(
+    code,
+    createContext({
+      exports,
+      ReadableStream,
+      Uint8Array,
+      DataView,
+      TextEncoder,
+      Error,
+      setTimeout: schedule,
+      clearTimeout: clear,
+      require: () => ({ nativeSetTimeout: schedule, nativeClearTimeout: clear }),
+    }),
+  );
   return exports.pdfScenePages;
 }
 const pdfScenePages = loadPdfScenePages();
@@ -49,8 +55,8 @@ test("cancelling a partially read PDF releases its page source without recording
   );
   const reader = stream.getReader();
   assert.equal(pages, 0);
-  assert.deepEqual([...((await reader.read()).value)], [2, 0, 0, 0]);
-  assert.deepEqual([...((await reader.read()).value)], [1, 9]);
+  assert.deepEqual([...(await reader.read()).value], [2, 0, 0, 0]);
+  assert.deepEqual([...(await reader.read()).value], [1, 9]);
   assert.equal(pages, 1);
   await reader.cancel("renderer stopped");
   assert.equal(frees, 1);
@@ -64,7 +70,9 @@ test("a recording failure releases and invalidates the page source", async () =>
   let resumes = 0;
   const stream = pdfScenePages(
     { pageCount: 2, free: () => frees++ },
-    () => { throw new Error("recording failed"); },
+    () => {
+      throw new Error("recording failed");
+    },
     () => {},
     () => invalidations++,
     () => resumes++,
@@ -106,10 +114,13 @@ test("the stream deadline reports an error and releases the page task gate", asy
   let expire;
   let frees = 0;
   let resumes = 0;
-  const pdfScenePagesWithClock = loadPdfScenePages((callback) => {
-    expire = callback;
-    return 1;
-  }, () => {});
+  const pdfScenePagesWithClock = loadPdfScenePages(
+    (callback) => {
+      expire = callback;
+      return 1;
+    },
+    () => {},
+  );
   const stream = pdfScenePagesWithClock(
     { pageCount: 2, free: () => frees++ },
     () => Uint8Array.of(1),

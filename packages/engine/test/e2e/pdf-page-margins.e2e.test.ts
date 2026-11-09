@@ -40,7 +40,11 @@ async function pdfPageCount(browser: Browser, pageRule: string, hash: string): P
     })) as { data?: string; error?: string };
     expect(reply.error, "printToPDF error").toBeUndefined();
     expect(typeof reply.data).toBe("string");
-    expect(createHash("sha256").update(Buffer.from(reply.data as string, "base64")).digest("hex")).toBe(hash);
+    expect(
+      createHash("sha256")
+        .update(Buffer.from(reply.data as string, "base64"))
+        .digest("hex"),
+    ).toBe(hash);
     const count = countPages(Buffer.from(reply.data as string, "base64"));
     expect(count, "parsed a page count").toBeGreaterThan(0);
     return count;
@@ -51,7 +55,11 @@ async function pdfPageCount(browser: Browser, pageRule: string, hash: string): P
 
 test("@page margins shrink the content box and add pages", async ({ browser }) => {
   expect(
-    await pdfPageCount(browser, "", "fb315e1d98b0d4b4f21d3a279912e1f96b0d66b006aab0a7d2a9a7137c3e5dae"),
+    await pdfPageCount(
+      browser,
+      "",
+      "fb315e1d98b0d4b4f21d3a279912e1f96b0d66b006aab0a7d2a9a7137c3e5dae",
+    ),
     "no @page margin",
   ).toBe(4);
   expect(

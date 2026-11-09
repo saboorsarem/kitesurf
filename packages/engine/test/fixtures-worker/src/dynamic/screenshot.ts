@@ -62,15 +62,22 @@ function screenshotNoisePng(): Uint8Array<ArrayBuffer> {
   );
   output.set([137, 80, 78, 71, 13, 10, 26, 10]);
   const view = new DataView(output.buffer);
-  let offset = writeChunk(output, view, PNG_SIGNATURE_BYTES, "IHDR", PNG_IHDR_BYTES, (dataOffset) => {
-    view.setUint32(dataOffset, WIDTH);
-    view.setUint32(dataOffset + 4, HEIGHT);
-    output[dataOffset + 8] = 8;
-    output[dataOffset + 9] = 2;
-    output[dataOffset + 10] = 0;
-    output[dataOffset + 11] = 0;
-    output[dataOffset + 12] = 0;
-  });
+  let offset = writeChunk(
+    output,
+    view,
+    PNG_SIGNATURE_BYTES,
+    "IHDR",
+    PNG_IHDR_BYTES,
+    (dataOffset) => {
+      view.setUint32(dataOffset, WIDTH);
+      view.setUint32(dataOffset + 4, HEIGHT);
+      output[dataOffset + 8] = 8;
+      output[dataOffset + 9] = 2;
+      output[dataOffset + 10] = 0;
+      output[dataOffset + 11] = 0;
+      output[dataOffset + 12] = 0;
+    },
+  );
   offset = writeChunk(output, view, offset, "IDAT", ZLIB_STREAM_BYTES, (dataOffset) => {
     let compressedOffset = dataOffset;
     output[compressedOffset++] = 0x78;

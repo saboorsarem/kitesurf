@@ -306,7 +306,12 @@ export class PageRendererManager {
         for (let attempt = 0; attempt < MAX_RENDER_RASTER_ATTEMPTS; attempt++) {
           try {
             const result = await this.renderFrameOnce(source, opts);
-            if (result.ok || result.stage !== "raster" || result.error?.startsWith("encoded-limit:")) return result;
+            if (
+              result.ok ||
+              result.stage !== "raster" ||
+              result.error?.startsWith("encoded-limit:")
+            )
+              return result;
             throw new Error(result.error ?? "renderFrame raster failure");
           } catch (error) {
             lastError = error instanceof Error ? error.message : String(error);

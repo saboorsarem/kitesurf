@@ -54,17 +54,26 @@ test("screenshot encodings match the unbanded renderer", async ({ page, cdpSessi
   }
 }, 120_000);
 
-test("captures full content and tall clips without changing the viewport", async ({ page, cdpSession }) => {
+test("captures full content and tall clips without changing the viewport", async ({
+  page,
+  cdpSession,
+}) => {
   await page.setViewport({ width: 1280, height: 720 });
-  await setContent(page, '<body style="margin:0"><div style="width:1280px;height:15000px;background:linear-gradient(red,blue)"></div></body>');
+  await setContent(
+    page,
+    '<body style="margin:0"><div style="width:1280px;height:15000px;background:linear-gradient(red,blue)"></div></body>',
+  );
   const full = await cdpSession.send("Page.captureScreenshot", { captureBeyondViewport: true });
   expect(pngDimensions(full.data)).toEqual([1280, 15000]);
   const memory = await cdpSession.send("Kitesurf.getMemoryStats", {});
-  console.log("[screenshot-full-page] wasm bytes", JSON.stringify({
-    engine: memory.engine?.wasmBytes,
-    pageScript: memory.total?.pageScriptBytes,
-    renderer: memory.renderer?.wasmBytes,
-  }));
+  console.log(
+    "[screenshot-full-page] wasm bytes",
+    JSON.stringify({
+      engine: memory.engine?.wasmBytes,
+      pageScript: memory.total?.pageScriptBytes,
+      renderer: memory.renderer?.wasmBytes,
+    }),
+  );
   const viewport = await cdpSession.send("Page.captureScreenshot", {});
   expect(pngDimensions(viewport.data)).toEqual([1280, 720]);
   const clip = await cdpSession.send("Page.captureScreenshot", {
@@ -72,22 +81,35 @@ test("captures full content and tall clips without changing the viewport", async
   });
   expect(pngDimensions(clip.data)).toEqual([1280, 6000]);
   for (const scale of [0, -1, 2, Number.NaN]) {
-    await expect(cdpSession.send("Page.captureScreenshot", {
-      clip: { x: 0, y: 0, width: 1280, height: 100, scale },
-    })).rejects.toThrow("clip.scale other than 1 is not supported");
+    await expect(
+      cdpSession.send("Page.captureScreenshot", {
+        clip: { x: 0, y: 0, width: 1280, height: 100, scale },
+      }),
+    ).rejects.toThrow("clip.scale other than 1 is not supported");
   }
-  await expect(cdpSession.send("Page.captureScreenshot", {
-    clip: { x: 0, y: 0, width: 65536, height: 1, scale: 1 },
-  })).rejects.toThrow("exceeds the 65535 px per-side raster limit");
-  await expect(cdpSession.send("Page.captureScreenshot", {
-    format: "webp", clip: { x: 0, y: 0, width: 2561, height: 2560, scale: 1 },
-  })).rejects.toThrow("WebP limits of 4096 px per side and 6553600 px total");
-  await expect(cdpSession.send("Page.captureScreenshot", {
-    format: "webp", clip: { x: 0, y: 0, width: 5000, height: 1000, scale: 1 },
-  })).rejects.toThrow("requested 5000x1000 px exceeds WebP limits of 4096 px per side");
+  await expect(
+    cdpSession.send("Page.captureScreenshot", {
+      clip: { x: 0, y: 0, width: 65536, height: 1, scale: 1 },
+    }),
+  ).rejects.toThrow("exceeds the 65535 px per-side raster limit");
+  await expect(
+    cdpSession.send("Page.captureScreenshot", {
+      format: "webp",
+      clip: { x: 0, y: 0, width: 2561, height: 2560, scale: 1 },
+    }),
+  ).rejects.toThrow("WebP limits of 4096 px per side and 6553600 px total");
+  await expect(
+    cdpSession.send("Page.captureScreenshot", {
+      format: "webp",
+      clip: { x: 0, y: 0, width: 5000, height: 1000, scale: 1 },
+    }),
+  ).rejects.toThrow("requested 5000x1000 px exceeds WebP limits of 4096 px per side");
 }, 120_000);
 
-test("rejects oversized encoded output and keeps the renderer usable", async ({ page, cdpSession }) => {
+test("rejects oversized encoded output and keeps the renderer usable", async ({
+  page,
+  cdpSession,
+}) => {
   const width = 2100;
   const height = 2100;
   await page.setViewport({ width: 1280, height: 720 });
@@ -95,20 +117,23 @@ test("rejects oversized encoded output and keeps the renderer usable", async ({ 
     waitUntil: "load",
     timeout: 300_000,
   });
-  await page.waitForFunction(
-    `document.querySelector("img")?.complete === true`,
-    { timeout: 30_000 },
-  );
+  await page.waitForFunction(`document.querySelector("img")?.complete === true`, {
+    timeout: 30_000,
+  });
   const image = await page.evaluate(`(() => {
     const image = document.querySelector("img");
     return { complete: image?.complete, width: image?.naturalWidth, height: image?.naturalHeight };
   })()`);
   expect(image).toEqual({ complete: true, width, height });
-  await expect(cdpSession.send("Page.captureScreenshot", {
-    format: "png", clip: { x: 0, y: 0, width, height, scale: 1 },
-  })).rejects.toThrow(/exceeds 16777216 bytes/);
+  await expect(
+    cdpSession.send("Page.captureScreenshot", {
+      format: "png",
+      clip: { x: 0, y: 0, width, height, scale: 1 },
+    }),
+  ).rejects.toThrow(/exceeds 16777216 bytes/);
   const recovery = await cdpSession.send("Page.captureScreenshot", {
-    format: "jpeg", clip: { x: 0, y: 0, width: 100, height: 100, scale: 1 },
+    format: "jpeg",
+    clip: { x: 0, y: 0, width: 100, height: 100, scale: 1 },
   });
   expect(recovery.data.length).toBeGreaterThan(0);
 }, 300_000);
