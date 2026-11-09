@@ -68,9 +68,7 @@ const BACKGROUND_EVENT_DRAIN_INTERVAL_MS = 200;
 const CDP_CONNECTION_ID_LENGTH = 10;
 const CDP_DEBUG_SESSION_ID_PREFIX_CHARS = 6;
 
-function isRawJsonSuccess(
-  payload: unknown,
-): payload is CdpSuccess & { result: RawJsonResult } {
+function isRawJsonSuccess(payload: unknown): payload is CdpSuccess & { result: RawJsonResult } {
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return false;
   const id: unknown = Reflect.get(payload, "id");
   const sessionId: unknown = Reflect.get(payload, "sessionId");

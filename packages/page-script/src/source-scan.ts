@@ -109,9 +109,7 @@ function needsMono(html: string): boolean {
     scannedTo = close.index + "</style>".length;
     if (mono.test(html.slice(open + 1, close.index))) return true;
   }
-  for (const [context] of html.matchAll(
-    /(?:class|style)\s*=\s*(?:"[^"]*"|'[^']*')/gi,
-  )) {
+  for (const [context] of html.matchAll(/(?:class|style)\s*=\s*(?:"[^"]*"|'[^']*')/gi)) {
     if (mono.test(context)) return true;
   }
   return false;

@@ -59,7 +59,8 @@ function outerHtmlJson(escaped: readonly string[]): RawJsonResult {
     const outerHTML = escaped
       .map((piece) => {
         const text: unknown = JSON.parse(`"${piece}"`);
-        if (typeof text !== "string") throw new TypeError("DOM.getOuterHTML: piece is not a string");
+        if (typeof text !== "string")
+          throw new TypeError("DOM.getOuterHTML: piece is not a string");
         return text;
       })
       .join("");

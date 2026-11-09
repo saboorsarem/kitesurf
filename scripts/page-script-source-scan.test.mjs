@@ -19,14 +19,20 @@ const { sourceDoctypeOf } = exports;
 test("finds the leading doctype after whitespace and comments", () => {
   // `runInNewContext` gives the result the VM realm's prototypes, which
   // `assert.deepEqual` from `node:assert/strict` rejects, so copy it here.
-  assert.deepEqual({ ...sourceDoctypeOf("<!doctype html>") }, {
-    markup: "<!DOCTYPE html>",
-    end: 15,
-  });
-  assert.deepEqual({ ...sourceDoctypeOf('  <!-- a -->\n<!DOCTYPE html PUBLIC "x">') }, {
-    markup: '<!DOCTYPE html PUBLIC "x">',
-    end: 39,
-  });
+  assert.deepEqual(
+    { ...sourceDoctypeOf("<!doctype html>") },
+    {
+      markup: "<!DOCTYPE html>",
+      end: 15,
+    },
+  );
+  assert.deepEqual(
+    { ...sourceDoctypeOf('  <!-- a -->\n<!DOCTYPE html PUBLIC "x">') },
+    {
+      markup: '<!DOCTYPE html PUBLIC "x">',
+      end: 39,
+    },
+  );
 });
 
 test("a comment body may contain an earlier -->", () => {

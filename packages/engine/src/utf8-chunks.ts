@@ -21,7 +21,7 @@ export function forEachUtf8Chunk(
   const units = Math.max(2, Math.floor(chunkUnits));
   // Each UTF-16 unit encodes to at most three bytes.
   const buffer = new Uint8Array(units * 3);
-  for (let start = 0; start < text.length; ) {
+  for (let start = 0; start < text.length;) {
     let end = Math.min(start + units, text.length);
     // A surrogate pair split across chunks would encode as two replacement characters.
     if (end < text.length && isHighSurrogate(text.charCodeAt(end - 1))) end--;

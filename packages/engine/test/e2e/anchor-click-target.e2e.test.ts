@@ -16,7 +16,10 @@ test("a click beside a link inside its wrapper does not follow the link", async 
   await setContent(page, MARKUP);
   await page.evaluate(() => {
     const wrap = document.getElementById("wrap")!;
-    wrap.addEventListener("click", () => (wrap.dataset.clicks = String(Number(wrap.dataset.clicks ?? 0) + 1)));
+    wrap.addEventListener(
+      "click",
+      () => (wrap.dataset.clicks = String(Number(wrap.dataset.clicks ?? 0) + 1)),
+    );
   });
   const box = await (await page.$("#wrap"))?.boundingBox();
   if (!box) throw new Error("#wrap has no layout box");
@@ -27,7 +30,9 @@ test("a click beside a link inside its wrapper does not follow the link", async 
   expect(await page.evaluate(() => location.hash)).toBe("");
 });
 
-test("a click inside an SVG but off its link's shape does not follow the link", async ({ page }) => {
+test("a click inside an SVG but off its link's shape does not follow the link", async ({
+  page,
+}) => {
   await setContent(
     page,
     '<svg id="pic" width="300" height="200" style="display:block"><a href="#target">' +
