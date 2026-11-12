@@ -4,8 +4,6 @@ Date: Thu, 5 Nov 2026 05:40:42 +0000
 Subject: [PATCH] Let a streaming reader sniff XHTML from a document prefix
 
 is_xhtml_document needs the document up to its root tag, which follows an unbounded prolog, so a reader that streams the page had to hold all of it. is_xhtml_document_prefix answers as soon as no continuation can change the answer: the sniff marks every point where it reads past its input, and returns None while any was reached. is_xhtml_document keeps its answer for complete input.
-
-Signed-off-by: bpereira <bpereira@cloudflare.com>
 ---
  src/html_sink.rs | 142 ++++++++++++++++++++++++++++++++++++-----------
  src/lib.rs       |   2 +-

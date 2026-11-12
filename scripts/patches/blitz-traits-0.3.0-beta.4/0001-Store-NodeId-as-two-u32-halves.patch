@@ -6,8 +6,6 @@ Subject: [PATCH] Store NodeId as two u32 halves
 A u64 field gives NodeId, and every struct holding one, 8-byte alignment.
 On wasm32 that pads each blitz-dom node slot by 4 bytes. Two u32 halves keep
 the same raw value, order, hash and formatting at 4-byte alignment.
-
-Signed-off-by: bpereira <bpereira@cloudflare.com>
 ---
  src/node_id.rs | 46 ++++++++++++++++++++++++++++++++++++++++------
  1 file changed, 40 insertions(+), 6 deletions(-)

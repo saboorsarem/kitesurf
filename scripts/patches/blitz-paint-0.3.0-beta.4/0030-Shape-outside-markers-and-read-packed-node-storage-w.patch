@@ -1,20 +1,27 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bpereira <bpereira@cloudflare.com>
-Date: Wed, 4 Nov 2026 04:25:02 +0000
-Subject: [PATCH] Read packed node storage through accessors
+Date: Thu, 12 Nov 2026 22:06:17 +0000
+Subject: [PATCH] Shape outside markers and read packed node storage when
+ painting
 
-Follow blitz-dom's packed node storage: links are slot indexes, a node's id comes from
-id(), special data from the element's rare box, and border, padding and scrollbar sizes
-from a layout that may keep them out of line. Paint output is unchanged.
+Shape outside list markers when painted: blitz-dom no longer keeps a shaped layout
+of each outside marker, so shape the marker from the list item's style and recorded
+scale when the item is painted, with the contexts that rebuild evicted text. Paint
+output is unchanged.
+
+Read packed node storage through accessors: links are slot indexes, a node's id
+comes from id(), special data from the element's rare box, and border, padding and
+scrollbar sizes from a layout that may keep them out of line. Paint output is
+unchanged.
 ---
  src/debug_overlay.rs        |  2 +-
- src/render.rs               | 47 +++++++++++++++++++------------------
- src/render/background.rs    |  6 ++---
+ src/render.rs               | 55 +++++++++++++++++++------------------
+ src/render/background.rs    |  6 ++--
  src/render/border.rs        |  2 +-
- src/render/form_controls.rs |  6 +++--
- src/text.rs                 |  6 ++---
- src/text_box_decorations.rs |  4 ++--
- 7 files changed, 38 insertions(+), 35 deletions(-)
+ src/render/form_controls.rs |  6 ++--
+ src/text.rs                 |  6 ++--
+ src/text_box_decorations.rs |  4 +--
+ 7 files changed, 42 insertions(+), 39 deletions(-)
 
 diff --git a/src/debug_overlay.rs b/src/debug_overlay.rs
 index d768b62..4ef8960 100644
@@ -30,10 +37,19 @@ index d768b62..4ef8960 100644
 
      let padding_border = padding + border;
 diff --git a/src/render.rs b/src/render.rs
-index ec6b4a9..b37745b 100644
+index dcf399a..6a7e556 100644
 --- a/src/render.rs
 +++ b/src/render.rs
-@@ -146,7 +146,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
+@@ -20,7 +20,7 @@ use crate::text::DrawTextContext;
+ use crate::{CustomWidgetSceneMap, SELECTION_COLOR};
+ use anyrender::{PaintScene, Scene, ScenePart};
+ use blitz_dom::node::{
+-    ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, TextInputData,
++    ListItemLayout, Marker, NodeData, RasterImageData, TextInputData,
+     TextNodeData,
+ };
+ use blitz_dom::{BaseDocument, ElementData, Node, NodeId, local_name};
+@@ -165,7 +165,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
              .collect();
 
          let layer_manager = LayerManager::default();
@@ -42,7 +58,7 @@ index ec6b4a9..b37745b 100644
 
          Self {
              dom,
-@@ -186,7 +186,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
+@@ -248,7 +248,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
          let Some(root_element) = self.dom.as_ref().try_root_element() else {
              return;
          };
@@ -51,7 +67,7 @@ index ec6b4a9..b37745b 100644
          let bg_width = (self.width as f32).max(root_element.final_layout().size.width);
          let bg_height = (self.height as f32).max(root_element.final_layout().size.height);
 
-@@ -209,10 +209,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
+@@ -271,10 +271,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
              if root_has_bg {
                  Some(root_element)
              } else {
@@ -64,7 +80,7 @@ index ec6b4a9..b37745b 100644
                          .filter(|node| node.data.is_element_with_tag_name(&local_name!("body")))
                  })
              }
-@@ -225,7 +225,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
+@@ -287,7 +287,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                      width: bg_width,
                      height: bg_height,
                  },
@@ -73,7 +89,7 @@ index ec6b4a9..b37745b 100644
              };
              let canvas_cx = self.element_cx(
                  source,
-@@ -385,7 +385,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
+@@ -447,7 +447,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
              padding,
              location,
              ..
@@ -82,7 +98,7 @@ index ec6b4a9..b37745b 100644
          let box_position = Vec2::new(location.x as f64, location.y as f64) * self.scale;
          let box_size = Size::new(size.width as f64, size.height as f64);
          // Node-local: `screen_transform` applies `box_position` below.
-@@ -471,7 +471,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
+@@ -533,7 +533,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
          // Apply CSS transform property (where transforms are 2d)
 
@@ -91,7 +107,7 @@ index ec6b4a9..b37745b 100644
 
          // If this element clips its overflow it establishes a scrollport: narrow the clip
          // rectangle passed to descendants to the visible (clipped) region so that content
-@@ -893,7 +893,7 @@ impl ElementCx<'_, '_> {
+@@ -955,7 +955,7 @@ impl ElementCx<'_, '_> {
 
          // scrollbar-color doesn't affect overlay visibility: persistence is
          // UA policy, not author styling.
@@ -100,7 +116,7 @@ index ec6b4a9..b37745b 100644
          let opacity = self.context.dom.scrollbar_opacity(node_id);
          if opacity == 0.0 {
              return;
-@@ -1013,11 +1013,12 @@ impl ElementCx<'_, '_> {
+@@ -1075,11 +1075,12 @@ impl ElementCx<'_, '_> {
                  layout,
                  self.context.dom,
                  transform,
@@ -115,7 +131,7 @@ index ec6b4a9..b37745b 100644
                  crate::text::draw_text_selection(
                      scene,
                      layout,
-@@ -1035,7 +1036,7 @@ impl ElementCx<'_, '_> {
+@@ -1097,7 +1098,7 @@ impl ElementCx<'_, '_> {
                  self.context.dom,
                  transform,
                  self.scale,
@@ -124,7 +140,7 @@ index ec6b4a9..b37745b 100644
                  &mut draw_text_context,
                  None,
              );
-@@ -1045,7 +1046,7 @@ impl ElementCx<'_, '_> {
+@@ -1107,7 +1108,7 @@ impl ElementCx<'_, '_> {
                  layout,
                  self.context.dom,
                  transform,
@@ -133,7 +149,7 @@ index ec6b4a9..b37745b 100644
              );
          }
      }
-@@ -1113,7 +1114,7 @@ impl ElementCx<'_, '_> {
+@@ -1175,7 +1176,7 @@ impl ElementCx<'_, '_> {
                  self.context.dom,
                  transform,
                  self.scale,
@@ -142,16 +158,23 @@ index ec6b4a9..b37745b 100644
                  &mut draw_text_context,
                  fill_override,
              );
-@@ -1123,7 +1124,7 @@ impl ElementCx<'_, '_> {
+@@ -1183,11 +1184,11 @@ impl ElementCx<'_, '_> {
+     }
+
      fn draw_marker(&self, scene: &mut impl PaintScene, pos: Point) {
-         if let Some(list_item) = self.list_item
-             && let Some(layout) =
--                list_item.outside_marker_layout(self.context.dom.tree(), self.node.id)
+-        if let Some(ListItemLayout {
+-            marker,
+-            position: ListItemLayoutPosition::Outside(layout),
+-        }) = self.list_item
++        if let Some(list_item) = self.list_item
++            && let Some(layout) =
 +                list_item.outside_marker_layout(self.context.dom.tree(), self.node.id())
          {
-             let marker = &list_item.marker;
++            let marker = &list_item.marker;
              // Right align and pad the bullet when rendering outside
-@@ -1171,7 +1172,7 @@ impl ElementCx<'_, '_> {
+             let x_padding = match marker {
+                 Marker::Char(_) => 8.0,
+@@ -1233,7 +1234,7 @@ impl ElementCx<'_, '_> {
                  self.context.dom,
                  transform,
                  self.scale,
@@ -160,7 +183,7 @@ index ec6b4a9..b37745b 100644
                  &mut draw_text_context,
                  None,
              );
-@@ -1189,7 +1190,7 @@ impl ElementCx<'_, '_> {
+@@ -1251,7 +1252,7 @@ impl ElementCx<'_, '_> {
 
          if let Some(hoisted) = self.node.stacking_context() {
              for hoisted_child in hoisted.neg_z_hoisted_children() {
@@ -169,7 +192,7 @@ index ec6b4a9..b37745b 100644
                  self.render_hoisted_child(
                      scene,
                      hoisted_child.node_id,
-@@ -1205,7 +1206,7 @@ impl ElementCx<'_, '_> {
+@@ -1267,7 +1268,7 @@ impl ElementCx<'_, '_> {
              for child_id in children.iter() {
                  let child = &self.context.dom.as_ref().tree()[*child_id];
                  let child_transform = match child.paint_parent_override() {
@@ -178,7 +201,7 @@ index ec6b4a9..b37745b 100644
                          if skip_rehomed {
                              continue;
                          }
-@@ -1222,7 +1223,7 @@ impl ElementCx<'_, '_> {
+@@ -1284,7 +1285,7 @@ impl ElementCx<'_, '_> {
                      // A fixed box contained by a transformed ancestor scrolls with it
                      // like any out-of-flow box.
                      _ if child.taffy_position() == taffy::Position::Fixed
@@ -187,7 +210,7 @@ index ec6b4a9..b37745b 100644
                      {
                          let scroll = self.context.dom.as_ref().tree().fixed_anchor_scroll();
                          parent_style_transform.pre_translate(kurbo::Vec2 {
-@@ -1239,7 +1240,7 @@ impl ElementCx<'_, '_> {
+@@ -1301,7 +1302,7 @@ impl ElementCx<'_, '_> {
          // Positive z_index hoisted nodes
          if let Some(hoisted) = self.node.stacking_context() {
              for hoisted_child in hoisted.pos_z_hoisted_children() {
@@ -196,7 +219,7 @@ index ec6b4a9..b37745b 100644
                  self.render_hoisted_child(
                      scene,
                      hoisted_child.node_id,
-@@ -1306,7 +1307,7 @@ impl ElementCx<'_, '_> {
+@@ -1368,7 +1369,7 @@ impl ElementCx<'_, '_> {
          let mut chain = Vec::new();
          let mut cursor = tree.get(child_id).and_then(|node| node.containing_block());
          while let Some(id) = cursor {
@@ -205,7 +228,7 @@ index ec6b4a9..b37745b 100644
                  break;
              }
              let node = tree.get(id)?;
-@@ -1323,7 +1324,7 @@ impl ElementCx<'_, '_> {
+@@ -1385,7 +1386,7 @@ impl ElementCx<'_, '_> {
              let origin = offset + Vec2::new(layout.location.x as f64, layout.location.y as f64);
              let scroll = node.scroll_offset();
              offset = origin - Vec2::new(scroll.x, scroll.y);
@@ -214,7 +237,7 @@ index ec6b4a9..b37745b 100644
                  continue;
              }
              let Some(styles) = node.primary_styles() else {
-@@ -1367,10 +1368,10 @@ impl ElementCx<'_, '_> {
+@@ -1429,10 +1430,10 @@ impl ElementCx<'_, '_> {
          };
          for child_id in children.iter() {
              let child = &self.context.dom.as_ref().tree()[*child_id];
@@ -228,7 +251,7 @@ index ec6b4a9..b37745b 100644
                  x: translation.x as f64 * self.scale,
                  y: translation.y as f64 * self.scale,
 diff --git a/src/render/background.rs b/src/render/background.rs
-index b02bc1d..e1ffccb 100644
+index cf4fd25..64f7b45 100644
 --- a/src/render/background.rs
 +++ b/src/render/background.rs
 @@ -232,7 +232,7 @@ impl ElementCx<'_, '_> {

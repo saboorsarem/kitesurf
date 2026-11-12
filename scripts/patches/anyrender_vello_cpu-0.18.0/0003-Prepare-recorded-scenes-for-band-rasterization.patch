@@ -4,8 +4,6 @@ Date: Tue, 3 Nov 2026 08:56:49 +0000
 Subject: [PATCH] Prepare recorded scenes for band rasterization
 
 Keep the scene and its image and glyph resources together for the duration of a banded capture.
-
-Signed-off-by: bpereira <bpereira@cloudflare.com>
 ---
  src/image_renderer.rs | 12 +++++++++++-
  1 file changed, 11 insertions(+), 1 deletion(-)

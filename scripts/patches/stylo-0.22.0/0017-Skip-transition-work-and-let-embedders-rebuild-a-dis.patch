@@ -1,19 +1,21 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bpereira <bpereira@cloudflare.com>
-Date: Mon, 2 Nov 2026 05:23:19 +0000
-Subject: [PATCH] Skip transition work that cannot start a transition
+Date: Thu, 12 Nov 2026 22:08:31 +0000
+Subject: [PATCH] Skip transition work and let embedders rebuild a display
+ value
 
-Testing interpolability constructs a midpoint even when equal animation values cannot
-start a transition. Evaluate the existing predicate only in the branches that consume
-it, preserving running-transition cancellation and retargeting.
+Skip transition work that cannot start a transition: testing interpolability
+constructs a midpoint even when equal animation values cannot start a transition,
+so the existing predicate is evaluated only in the branches that consume it, and a
+discrete property with no existing transitions and normal transition behavior
+returns before cloning and converting its computed values. Running-transition
+cancellation and retargeting are preserved.
 
-With no existing transitions and normal transition behavior, a discrete property cannot
-start a transition or cancel an existing one. Return before cloning and converting its
-computed values. Keep the full path when any transition record exists or discrete
-transitions are allowed.
+Let embedders rebuild a display value from its parts.
 ---
- servo/animation.rs | 21 ++++++++++++++++-----
- 1 file changed, 16 insertions(+), 5 deletions(-)
+ servo/animation.rs      | 21 ++++++++++++++++-----
+ values/specified/box.rs |  5 +++--
+ 2 files changed, 19 insertions(+), 7 deletions(-)
 
 diff --git a/servo/animation.rs b/servo/animation.rs
 index 615004b..1553c11 100644
@@ -68,3 +70,20 @@ index 615004b..1553c11 100644
              if current_value == to || !transitionable_from_current_value {
                  existing_transition.state = AnimationState::Canceled;
                  self.dirty = true;
+diff --git a/values/specified/box.rs b/values/specified/box.rs
+index 7bee119..fdcaa3c 100644
+--- a/values/specified/box.rs
++++ b/values/specified/box.rs
+@@ -325,9 +325,10 @@ impl Display {
+         Self((outside as u16) << Self::OUTSIDE_SHIFT | inside as u16)
+     }
+
+-    /// Make a display enum value from <display-outside> and <display-inside> values.
++    /// Make a display enum value from <display-outside> and <display-inside> values. Every
++    /// `Display` equals `from3` of its `outside()`, `inside()` and `is_list_item()`.
+     #[inline]
+-    fn from3(outside: DisplayOutside, inside: DisplayInside, list_item: bool) -> Self {
++    pub fn from3(outside: DisplayOutside, inside: DisplayInside, list_item: bool) -> Self {
+         let v = Self::new(outside, inside);
+         if !list_item {
+             return v;

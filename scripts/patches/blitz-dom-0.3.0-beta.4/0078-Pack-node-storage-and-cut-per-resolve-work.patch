@@ -1,78 +1,85 @@
-From 4b65ded825a0876a64572a571aa856e0cf579211 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bpereira <bpereira@cloudflare.com>
-Date: Wed, 4 Nov 2026 03:21:46 +0000
-Subject: [PATCH] Pack node storage into a chunked slab of small nodes
+Date: Thu, 12 Nov 2026 22:05:40 +0000
+Subject: [PATCH] Pack node storage and cut per-resolve work
 
-Per-node storage dominated wasm memory on large documents: html.spec.whatwg.org has
-730k nodes (337k elements, 393k text) and tc39.es/ecma262 420k. This shrinks each node
-and the data hanging off it, without changing behaviour:
+Pack node storage into a chunked slab of small nodes: nodes live once in 1,024-slot
+chunks with versions stored once per slot, tree links are u32 slot indexes with slot
+0 as none, a lone child is stored inline in the child-list word, element and layout
+data come from typed slot pools, border, padding and scrollbar sizes live in a
+pooled BoxEdges that exists only while one is non-zero, text content and attribute
+values are CompactStrings inline up to 12 bytes, and stylo's element data cell, its
+init state and the node flags share one byte. Measured on frozen copies with
+byte-identical output HTML, wasm memory falls 232.4 -> 170.9 MB on
+html.spec.whatwg.org and 148.9 -> 113.0 MB on tc39.es/ecma262, with load CPU within
+run-to-run noise.
 
-- Nodes live once in a slab of 1,024-slot chunks, with versions in separate chunks and
-  stored once per slot. Growth never copies or over-reserves, so the node-count estimate
-  and capacity hint are gone. A node id is checked against the slot's version only at the
-  API boundary.
-- Tree links (parent, layout parent, children) are u32 slot indexes; slot 0 is "none".
-  The slot index sits in the low 27 bits of the flags word; wasm32 memory cannot hold
-  2^27 nodes. The layout parent uses two spare bits of the parent link (none, same as the
-  DOM parent, or other in a side table). A lone child, the case for 34% of nodes, is
-  stored inline in the child-list word.
-- ElementData and LayoutData come from typed slot pools instead of a box each.
-  Derived layout and paint child lists live in LayoutData, special data in the boxed
-  ElementRare, and border, padding and scrollbar sizes in a pooled BoxEdges that exists
-  only while one of them is non-zero (75-79% of boxes have none). final_layout() and
-  unrounded_layout() return Layout by value; writers go through set_*_layout.
-- Text content and attribute values are CompactStrings, inline up to 12 bytes (75% of
-  text nodes).
-- Stylo's element data cell, its init state and the node flags share one byte, and the
-  selector flags, state bits, element bits and constructed display share one atomic
-  word, with compile-time fit checks. ElementData is 56 bytes in release wasm32.
+Track a base epoch that moves only when the base URL can change.
 
-Dropping a node also removes it from an anonymous block that wraps it, so no link names a
-freed slot. Node fields are read through accessors (id(), parent_id(), children(),
-special_data(), ...).
+Record static inline offsets of absolutely positioned boxes when evicting, with the
+inputs that aligned them, and reuse an offset only for a layout pass with identical
+inputs; measure passes place no boxes, so they keep breaking from the summary.
 
-Measured on frozen copies of both pages, with output HTML byte-identical: wasm memory
-html.spec.whatwg.org 232.4 -> 170.9 MB, tc39.es/ecma262 148.9 -> 113.0 MB. Load CPU
-within run-to-run noise.
+Cut allocations in damage, font-face and inline-root bookkeeping: fold the damage
+summary in one pass over the nodes instead of collecting a list, lowercase each
+family atom once per scan and borrow span family names, enter each inline root in
+the inline-root index once per held layout rather than on every box construction,
+shrink the index after pruning when under half full, and reuse the text-node range
+buffer across inline layout builds. On html.spec.whatwg.org, allocations fall from
+6.64M to 4.52M and realloc copies from 75.9 to 45.8 MB. Output is unchanged.
+
+Collect parsed attributes straight into the element's list: Attributes implements
+FromIterator and create_element takes impl Into<Attributes>, so the parser no longer
+builds a Vec only to copy it into the ThinVec.
+
+Align caption margin adjustments for Taffy's tagged pointers: the adjustment is
+handed to Taffy as a calc() pointer and CompactLength keeps its tag in the pointer's
+low three bits, and on wasm32 the struct only asked for 4-byte alignment, which held
+only because dlmalloc rounds every chunk to 8. An allocator that honours the
+requested alignment failed Taffy's assertion and panicked during table layout.
 ---
  Cargo.toml                 |   6 +-
  src/accessibility.rs       |   6 +-
  src/config.rs              |   7 -
  src/debug.rs               |  22 +-
- src/document.rs            | 177 +++----
+ src/document.rs            | 211 +++++----
  src/events/driver.rs       |   2 +-
  src/events/pointer.rs      |  36 +-
  src/form.rs                |   6 +-
  src/iframe.rs              |   1 -
- src/layout/construct.rs    | 127 +++--
+ src/layout/construct.rs    | 154 +++---
  src/layout/counters.rs     |  12 +-
  src/layout/damage.rs       |  42 +-
- src/layout/inline.rs       |  17 +-
+ src/layout/evict.rs        |  64 ++-
+ src/layout/inline.rs       | 107 +++--
  src/layout/list.rs         |   2 +-
  src/layout/mod.rs          |  18 +-
  src/layout/paint_tree.rs   |  13 +-
- src/layout/table.rs        |  28 +-
+ src/layout/table.rs        |  31 +-
  src/layout/writing_mode.rs |  13 +-
  src/lib.rs                 |   1 +
- src/mutator.rs             | 206 ++++----
- src/node/attributes.rs     |  28 +-
+ src/mutator.rs             | 272 +++++++----
+ src/net.rs                 |  30 +-
+ src/node/attributes.rs     |  46 +-
  src/node/child_list.rs     | 201 ++++++++
- src/node/element.rs        | 881 ++++++++++++++++++++++++++++------
- src/node/mod.rs            |   3 +-
+ src/node/element.rs        | 886 ++++++++++++++++++++++++++++------
+ src/node/mod.rs            |   6 +-
  src/node/node.rs           | 942 ++++++++++++++++++++++++++++++-------
  src/node/scrollbar.rs      |   2 +-
  src/node/serialize.rs      |  17 +-
  src/node/stylo_data.rs     | 403 ++++++++++++++--
+ src/node/text.rs           |  85 +++-
  src/pool.rs                | 189 ++++++++
  src/query_selector.rs      |  12 +-
- src/resolve.rs             |  45 +-
+ src/resolve.rs             |  62 ++-
  src/resolved_style.rs      |   6 +-
  src/scrolling.rs           |  14 +-
  src/stylo.rs               |  49 +-
+ src/stylo_to_parley.rs     |  88 ++--
  src/traversal.rs           |  83 ++--
  src/tree.rs                | 405 +++++++++++++---
  src/util.rs                |  10 +-
- 37 files changed, 3140 insertions(+), 892 deletions(-)
+ 41 files changed, 3561 insertions(+), 1001 deletions(-)
  create mode 100644 src/node/child_list.rs
  create mode 100644 src/pool.rs
 
@@ -83,23 +90,23 @@ index da0916a..214771a 100644
 @@ -98,6 +98,9 @@ default-features = false
  [dependencies.color]
  version = "0.3"
- 
+
 +[dependencies.compact_str]
 +version = "0.8"
 +
  [dependencies.cssparser]
  version = "0.38.0"
- 
+
 @@ -169,9 +172,6 @@ version = "0.44"
  features = ["std"]
  default-features = false
- 
+
 -[dependencies.slotmap]
 -version = "1.0.7"
 -
  [dependencies.smallvec]
  version = "1"
- 
+
 diff --git a/src/accessibility.rs b/src/accessibility.rs
 index f62d7bf..2f7a4e0 100644
 --- a/src/accessibility.rs
@@ -110,7 +117,7 @@ index f62d7bf..2f7a4e0 100644
      ) -> (NodeId, AccessKitNode) {
 -        let id = NodeId(node.id.as_u64());
 +        let id = NodeId(node.id().as_u64());
- 
+
          let mut builder = AccessKitNode::default();
 -        if node.parent.get().is_none() {
 +        if node.parent_id().is_none() {
@@ -141,7 +148,7 @@ index 0c22173..da35637 100644
 -    /// documents. The embedder can estimate this from the source HTML.
 -    pub node_capacity_hint: Option<usize>,
  }
- 
+
  impl Default for DocumentConfig {
 @@ -97,7 +91,6 @@ impl Default for DocumentConfig {
              incremental: None,
@@ -156,7 +163,7 @@ index 43a3d02..4cc3a27 100644
 --- a/src/debug.rs
 +++ b/src/debug.rs
 @@ -6,7 +6,7 @@ use crate::layout::TaffyDebugTree;
- 
+
  impl BaseDocument {
      pub fn print_taffy_tree(&self) {
 -        let root_id = crate::taffy_node_id(self.root_element().id);
@@ -167,19 +174,19 @@ index 43a3d02..4cc3a27 100644
 @@ -25,7 +25,7 @@ impl BaseDocument {
              tracing::info!("Display: {:?}", node.taffy_display());
          }
- 
+
 -        println!("\nNode {} {}", node.id, node.node_debug_str());
 +        println!("\nNode {} {}", node.id(), node.node_debug_str());
- 
+
          println!("Attrs:");
- 
+
 @@ -116,22 +116,22 @@ impl BaseDocument {
              t = layout.margin.top,
              b = layout.margin.bottom,
          );
 -        println!("Parent: {:?}", node.parent.get());
 +        println!("Parent: {:?}", node.parent_id());
- 
+
          let children: Vec<_> = node
 -            .children
 +            .children()
@@ -190,10 +197,10 @@ index 43a3d02..4cc3a27 100644
 +            .map(|node| (node.id(), node.order(), node.node_debug_str()))
              .collect();
          println!("Children: {children:?}");
- 
+
 -        println!("Layout Parent: {:?}", node.layout_parent.get());
 +        println!("Layout Parent: {:?}", node.layout_parent_id());
- 
+
          let layout_children: Option<Vec<_>> = node.layout_children().as_ref().map(|lc| {
              lc.iter()
                  .map(|id| &self.nodes[*id])
@@ -227,22 +234,43 @@ index 43a3d02..4cc3a27 100644
 -            *doc.nodes[child].final_layout()
 +            doc.nodes[child].final_layout()
          );
- 
+
          let mut output = Vec::new();
 diff --git a/src/document.rs b/src/document.rs
-index 8d4090d..61145f8 100644
+index 8d4090d..c5955e3 100644
 --- a/src/document.rs
 +++ b/src/document.rs
 @@ -357,7 +357,7 @@ pub struct BaseDocument {
      // rx will always be Some, except temporarily while processing events
      pub(crate) rx: Option<Receiver<DocumentEvent>>,
- 
+
 -    /// A slotmap-backed tree of nodes
 +    /// A slab-backed tree of nodes
      ///
      /// We pin the tree to a guarantee to the nodes it creates that the tree is stable in memory.
      /// There is no way to create the tree - publicly or privately - that would invalidate that invariant.
-@@ -656,14 +656,9 @@ impl BaseDocument {
+@@ -487,6 +487,10 @@ pub struct BaseDocument {
+     /// Length of `inline_roots` when it was last left sorted+deduped, so a
+     /// frame that pushed nothing new can skip re-sorting 80k+ entries.
+     pub(crate) inline_roots_settled: usize,
++    /// Some inline root got its layout back from construction or a layout pass since
++    /// restore_clobbered_inline_breaks last ran. A root already in `inline_roots` is not pushed
++    /// again, so the index length alone no longer tells.
++    pub(crate) inline_roots_put: bool,
+     /// Inline roots farther than this many viewport heights from the viewport
+     /// drop their shaped text after each resolve; `None` keeps every layout.
+     pub(crate) inline_layout_eviction_viewports: Option<f32>,
+@@ -568,6 +572,9 @@ pub struct BaseDocument {
+     /// embedder loads fallback faces for scripts it finds in the navigate
+     /// HTML; a bump here tells it script-written text may need more.
+     pub(crate) non_latin_text_writes: u32,
++    /// Moves whenever a connected `<base>` is added or removed or its href is written, so the
++    /// embedder re-resolves the base URL only when it can have changed.
++    pub base_epoch: u32,
+
+     /// Tracks in-flight image requests. When an image is being fetched, additional
+     /// requests for the same URL are queued here instead of starting new fetches.
+@@ -656,14 +663,9 @@ impl BaseDocument {
          let device = make_device(&viewport, media_type.clone(), font_ctx.clone());
          let stylist = Stylist::new(device, QuirksMode::NoQuirks);
          let snapshots = SnapshotMap::new();
@@ -258,7 +286,23 @@ index 8d4090d..61145f8 100644
              guard.clone(),
              crate::node::InlineRebuild {
                  font_ctx: font_ctx.clone(),
-@@ -868,7 +863,7 @@ impl BaseDocument {
+@@ -759,6 +761,7 @@ impl BaseDocument {
+             any_node_created: false,
+             inline_roots: Vec::new(),
+             inline_roots_settled: 0,
++            inline_roots_put: false,
+             inline_layout_eviction_viewports: Some(2.0),
+             inline_keep_extent: None,
+             last_inline_eviction_scan: None,
+@@ -781,6 +784,7 @@ impl BaseDocument {
+             used_font_families: std::collections::HashSet::new(),
+             used_codepoints: Vec::new(),
+             non_latin_text_writes: 0,
++            base_epoch: 0,
+             pending_images: HashMap::new(),
+             pending_style_image_nodes: Vec::new(),
+             pending_critical_resources: HashSet::new(),
+@@ -868,7 +872,7 @@ impl BaseDocument {
      /// two children for the life of the document.
      pub fn shrink_node_storage(&mut self) {
          for (_, node) in self.nodes.iter_mut() {
@@ -267,16 +311,16 @@ index 8d4090d..61145f8 100644
              match &mut node.data {
                  NodeData::Text(text) => text.content.shrink_to_fit(),
                  NodeData::Element(el) | NodeData::AnonymousBlock(el) => {
-@@ -920,7 +915,7 @@ impl BaseDocument {
- 
+@@ -920,7 +924,7 @@ impl BaseDocument {
+
      pub fn get_focussed_node_id(&self) -> Option<NodeId> {
          self.focus_node_id
 -            .or(self.try_root_element().map(|el| el.id))
 +            .or(self.try_root_element().map(|el| el.id()))
      }
- 
+
      pub fn mutate<'doc>(&'doc mut self) -> DocumentMutator<'doc> {
-@@ -1175,13 +1170,13 @@ impl BaseDocument {
+@@ -1175,13 +1179,13 @@ impl BaseDocument {
          {
              return false;
          }
@@ -292,7 +336,7 @@ index 8d4090d..61145f8 100644
          {
              return false;
          }
-@@ -1192,9 +1187,9 @@ impl BaseDocument {
+@@ -1192,9 +1196,9 @@ impl BaseDocument {
          if !root_visible {
              return false;
          }
@@ -304,16 +348,16 @@ index 8d4090d..61145f8 100644
              .find(|child| {
                  child
                      .element_data()
-@@ -1203,7 +1198,7 @@ impl BaseDocument {
+@@ -1203,7 +1207,7 @@ impl BaseDocument {
                          .primary_styles()
                          .is_some_and(|styles| !styles.clone_display().is_none())
              })
 -            .is_some_and(|body| body.id == node_id)
 +            .is_some_and(|body| body.id() == node_id)
      }
- 
+
      /// Whether `node_id` clips the boxes it paints: non-`visible` overflow
-@@ -1211,7 +1206,7 @@ impl BaseDocument {
+@@ -1211,7 +1215,7 @@ impl BaseDocument {
      /// `contain: paint`. Mirrors blitz-paint's clip decision for elements.
      pub fn clips_descendants(&self, node_id: NodeId) -> bool {
          use style::values::computed::{Contain, Overflow};
@@ -322,8 +366,8 @@ index 8d4090d..61145f8 100644
              || self.propagates_overflow_to_viewport(node_id)
          {
              return false;
-@@ -1249,7 +1244,7 @@ impl BaseDocument {
- 
+@@ -1249,7 +1253,7 @@ impl BaseDocument {
+
          // parent = host (while staying OUT of host.children) keeps
          // mark_ancestors_dirty working across the shadow boundary.
 -        self.nodes[shadow_root_id].parent.set(Some(host_id));
@@ -331,7 +375,7 @@ index 8d4090d..61145f8 100644
          if self.nodes[host_id].flags.is_in_document() {
              self.nodes[shadow_root_id]
                  .flags
-@@ -1287,7 +1282,7 @@ impl BaseDocument {
+@@ -1287,7 +1291,7 @@ impl BaseDocument {
              // Slots of this tree, pre-order: walk light children only
              // (nested hosts' shadow trees own their own slots).
              let mut slots: Vec<NodeId> = Vec::new();
@@ -340,16 +384,16 @@ index 8d4090d..61145f8 100644
              while let Some(id) = stack.pop() {
                  let Some(node) = self.nodes.get(id) else {
                      continue;
-@@ -1295,7 +1290,7 @@ impl BaseDocument {
+@@ -1295,7 +1299,7 @@ impl BaseDocument {
                  if node.is_slot_element() {
                      slots.push(id);
                  }
 -                stack.extend(node.children.iter().rev().copied());
 +                stack.extend(node.children().iter().rev());
              }
- 
+
              // Name -> slot, first-in-tree-order wins; "" is the default
-@@ -1320,7 +1315,7 @@ impl BaseDocument {
+@@ -1320,7 +1324,7 @@ impl BaseDocument {
              let host_children: Vec<NodeId> = self
                  .nodes
                  .get(host_id)
@@ -358,7 +402,7 @@ index 8d4090d..61145f8 100644
                  .unwrap_or_default();
              for child_id in host_children {
                  let Some(child) = self.nodes.get(child_id) else {
-@@ -1364,13 +1359,26 @@ impl BaseDocument {
+@@ -1364,13 +1368,26 @@ impl BaseDocument {
      /// it so that stale NodeIds are never dereferenced after the slot is freed.
      pub(crate) fn remove_node_from_tree(&mut self, node_id: NodeId) -> Option<Node> {
          self.clear_interaction_state_for_removed_node(node_id);
@@ -386,7 +430,7 @@ index 8d4090d..61145f8 100644
                  if let Some(children) = node.layout_children() {
                      ids.extend(children.iter().copied());
                  }
-@@ -1379,8 +1387,8 @@ impl BaseDocument {
+@@ -1379,8 +1396,8 @@ impl BaseDocument {
              .unwrap_or_default();
          for child_id in laid_out {
              if let Some(child) = self.nodes.get(child_id) {
@@ -397,7 +441,7 @@ index 8d4090d..61145f8 100644
                  }
              }
          }
-@@ -1421,13 +1429,13 @@ impl BaseDocument {
+@@ -1421,13 +1438,13 @@ impl BaseDocument {
      /// reference is removed. Tolerates already-removed ancestors (subtree
      /// teardown proceeds root-first) by giving up and returning `None`.
      fn nearest_surviving_element_ancestor(&self, node_id: NodeId) -> Option<NodeId> {
@@ -413,17 +457,17 @@ index 8d4090d..61145f8 100644
          }
          None
      }
-@@ -1518,7 +1526,7 @@ impl BaseDocument {
+@@ -1518,7 +1535,7 @@ impl BaseDocument {
                  self.drop_node_ignoring_parent_with(after, on_drop);
              }
- 
+
 -            for &child in &node.children {
 +            for child in node.children() {
                  self.drop_node_ignoring_parent_with(child, on_drop);
              }
- 
-@@ -1566,8 +1574,7 @@ impl BaseDocument {
- 
+
+@@ -1566,8 +1583,7 @@ impl BaseDocument {
+
      pub fn create_text_node(&mut self, text: &str) -> NodeId {
          self.note_text_codepoints(text, false);
 -        let content = text.to_string();
@@ -431,17 +475,17 @@ index 8d4090d..61145f8 100644
 +        let data = NodeData::Text(TextNodeData::new(text));
          self.create_node(data)
      }
- 
-@@ -1591,20 +1598,20 @@ impl BaseDocument {
+
+@@ -1591,20 +1607,20 @@ impl BaseDocument {
              _ => {}
          }
- 
+
 -        let children = node.children.clone();
 +        let children = node.children().to_vec();
- 
+
          // Create new node
          let new_node_id = self.create_node(data);
- 
+
          // Recursively clone children
 -        let new_children: ThinVec<NodeId> = children
 +        let new_children: Vec<NodeId> = children
@@ -454,10 +498,10 @@ index 8d4090d..61145f8 100644
          }
 -        self.nodes[new_node_id].children = new_children;
 +        self.nodes[new_node_id].set_children(new_children);
- 
+
          new_node_id
      }
-@@ -1613,7 +1620,7 @@ impl BaseDocument {
+@@ -1613,7 +1629,7 @@ impl BaseDocument {
          fn remove_pe_ignoring_parent(doc: &mut BaseDocument, node_id: NodeId) -> Option<Node> {
              let mut node = doc.remove_node_from_tree(node_id);
              if let Some(node) = &mut node {
@@ -466,9 +510,9 @@ index 8d4090d..61145f8 100644
                      remove_pe_ignoring_parent(doc, child);
                  }
                  for &anon_id in node.anonymous_blocks() {
-@@ -1626,9 +1633,9 @@ impl BaseDocument {
+@@ -1626,9 +1642,9 @@ impl BaseDocument {
          let node = remove_pe_ignoring_parent(self, node_id);
- 
+
          // Update child_idx values
 -        if let Some(parent_id) = node.as_ref().and_then(|node| node.parent.get()) {
 +        if let Some(parent_id) = node.as_ref().and_then(|node| node.parent_id()) {
@@ -476,18 +520,48 @@ index 8d4090d..61145f8 100644
 -            parent.children.retain(|id| *id != node_id);
 +            parent.remove_child(node_id);
          }
- 
+
          node
-@@ -1920,7 +1927,7 @@ impl BaseDocument {
- 
+@@ -1920,7 +1936,7 @@ impl BaseDocument {
+
          // Store data on element
          let element = &mut self.nodes[node_id].element_data_mut().unwrap();
 -        element.special_data = SpecialElementData::Stylesheet(stylesheet.clone());
 +        element.set_special_data(SpecialElementData::Stylesheet(stylesheet.clone()));
- 
+
          if let Some(shadow_root_id) = shadow_scope {
              // Appends arrive in tree order (process_added_subtree is a
-@@ -2512,7 +2519,7 @@ impl BaseDocument {
+@@ -2144,6 +2160,10 @@ impl BaseDocument {
+             .retain(|f| !used.contains(&f.family_lc) || { ready.push(f.clone()); false });
+         if !self.pending_font_faces.is_empty() {
+             let mut used = std::mem::take(&mut self.used_font_families);
++            // Lowercase each distinct family atom once, not once per node: nodes share font
++            // structs, so most nodes repeat the previous node's list or a few known atoms.
++            let mut seen: std::collections::HashSet<style::Atom> = Default::default();
++            let mut previous: *const style::properties::style_structs::Font = std::ptr::null();
+             for (_, node) in self.nodes.iter() {
+                 if !node.flags.is_in_document() {
+                     continue;
+@@ -2151,9 +2171,16 @@ impl BaseDocument {
+                 let Some(styles) = node.primary_styles() else {
+                     continue;
+                 };
+-                for family in styles.get_font().font_family.families.iter() {
++                let font = styles.get_font();
++                if std::ptr::eq(font, previous) {
++                    continue;
++                }
++                previous = font;
++                for family in font.font_family.families.iter() {
+                     if let SingleFontFamily::FamilyName(name) = family {
+-                        used.insert(name.name.to_string().to_lowercase());
++                        if seen.insert(name.name.clone()) {
++                            used.insert(name.name.to_string().to_lowercase());
++                        }
+                     }
+                 }
+             }
+@@ -2512,7 +2539,7 @@ impl BaseDocument {
              return false;
          };
          let mut changed = false;
@@ -496,7 +570,7 @@ index 8d4090d..61145f8 100644
              changed |= kitesurf_materialize_image_data(data, hint, ceiling);
          }
          let (background_images, mask_images) = el.image_layers_mut();
-@@ -2551,16 +2558,16 @@ impl BaseDocument {
+@@ -2551,16 +2578,16 @@ impl BaseDocument {
          if el.name.local != local_name!("canvas") {
              return -1;
          }
@@ -516,7 +590,7 @@ index 8d4090d..61145f8 100644
          if size_changed {
              node.clear_layout_cache();
              node.insert_damage(ALL_DAMAGE);
-@@ -2602,16 +2609,16 @@ impl BaseDocument {
+@@ -2602,16 +2629,16 @@ impl BaseDocument {
          if el.name.local != local_name!("iframe") {
              return -1;
          }
@@ -536,7 +610,7 @@ index 8d4090d..61145f8 100644
          if size_changed {
              node.clear_layout_cache();
              node.insert_damage(ALL_DAMAGE);
-@@ -2634,10 +2641,10 @@ impl BaseDocument {
+@@ -2634,10 +2661,10 @@ impl BaseDocument {
          if el.name.local != local_name!("iframe") {
              return;
          }
@@ -549,7 +623,7 @@ index 8d4090d..61145f8 100644
          node.clear_layout_cache();
          node.insert_damage(ALL_DAMAGE);
      }
-@@ -2656,10 +2663,10 @@ impl BaseDocument {
+@@ -2656,10 +2683,10 @@ impl BaseDocument {
          if el.name.local != local_name!("canvas") {
              return;
          }
@@ -562,26 +636,26 @@ index 8d4090d..61145f8 100644
          node.clear_layout_cache();
          node.insert_damage(ALL_DAMAGE);
      }
-@@ -2690,7 +2697,7 @@ impl BaseDocument {
+@@ -2690,7 +2717,7 @@ impl BaseDocument {
                      if element.custom_widget_data().is_some() {
                          continue;
                      }
 -                    element.special_data = SpecialElementData::Image(Box::new(image.clone()));
 +                    element.set_special_data(SpecialElementData::Image(Box::new(image.clone())));
- 
+
                      // Clear layout cache
                      node.clear_layout_cache();
-@@ -2755,8 +2762,7 @@ impl BaseDocument {
- 
+@@ -2755,8 +2782,7 @@ impl BaseDocument {
+
          let opaque_node_id = TNode::opaque(&&*node);
          node.set_has_snapshot(true);
 -        node.snapshot_handled()
 -            .store(false, std::sync::atomic::Ordering::SeqCst);
 +        node.set_snapshot_handled(false);
- 
+
          // A snapshot records the element's state/attributes as they were *before the first
          // mutation* since the last style flush (matching Gecko's ServoElementSnapshot
-@@ -2790,9 +2796,9 @@ impl BaseDocument {
+@@ -2790,9 +2816,9 @@ impl BaseDocument {
                                  .split_ascii_whitespace()
                                  .map(Atom::from)
                                  .collect();
@@ -591,18 +665,18 @@ index 8d4090d..61145f8 100644
 -                            AttrValue::String(attr.value.clone())
 +                            AttrValue::String(attr.value.to_string())
                          };
- 
+
                          (ident, value)
-@@ -2890,7 +2896,7 @@ impl BaseDocument {
+@@ -2890,7 +2916,7 @@ impl BaseDocument {
          let Some(hit) = self.hit(x, y) else {
              // The point is within the viewport but over no box: the root element
              // (which covers the viewport in an HTML document) is the hit target
 -            return self.try_root_element().map(|root| root.id);
 +            return self.try_root_element().map(|root| root.id());
          };
- 
+
          // Resolve anonymous boxes / pseudo-elements, then text nodes, to elements
-@@ -2900,7 +2906,7 @@ impl BaseDocument {
+@@ -2900,7 +2926,7 @@ impl BaseDocument {
              if node.is_element() {
                  return Some(node_id);
              }
@@ -610,8 +684,8 @@ index 8d4090d..61145f8 100644
 +            node_id = node.parent_id()?;
          }
      }
- 
-@@ -2918,7 +2924,7 @@ impl BaseDocument {
+
+@@ -2918,7 +2944,7 @@ impl BaseDocument {
              element_ids.push(node_id);
              current = self
                  .get_node(node_id)
@@ -620,7 +694,7 @@ index 8d4090d..61145f8 100644
                  .filter(|parent_id| {
                      self.get_node(*parent_id)
                          .is_some_and(|node| node.is_element())
-@@ -2945,12 +2951,12 @@ impl BaseDocument {
+@@ -2945,12 +2971,12 @@ impl BaseDocument {
          // exactly once.
          let mut node = self.get_node(node_id)?;
          loop {
@@ -636,7 +710,7 @@ index 8d4090d..61145f8 100644
              }
              node = parent;
          }
-@@ -3302,7 +3308,7 @@ impl BaseDocument {
+@@ -3302,7 +3328,7 @@ impl BaseDocument {
              .collect();
          for id in svg_roots {
              if let Some(el) = self.nodes[id].element_data_mut() {
@@ -645,7 +719,7 @@ index 8d4090d..61145f8 100644
              }
              self.iter_subtree_mut(id, |sid, doc| {
                  doc.nodes[sid].insert_damage(crate::layout::damage::ALL_DAMAGE);
-@@ -3459,7 +3465,7 @@ impl BaseDocument {
+@@ -3459,7 +3485,7 @@ impl BaseDocument {
          // (`light-dark()`, system colors) without necessarily flipping any
          // media query result, so conservatively recascade the whole tree.
          if changes.contains(DeviceChanges::COLOR_SCHEME) {
@@ -654,25 +728,25 @@ index 8d4090d..61145f8 100644
                  self.nodes[root_id].set_restyle_hint(RestyleHint::recascade_subtree());
              }
          }
-@@ -3574,7 +3580,7 @@ impl BaseDocument {
+@@ -3574,7 +3600,7 @@ impl BaseDocument {
                  return Some(CursorIcon::Pointer);
              }
- 
+
 -            maybe_node = node.layout_parent.get().map(|node_id| node.with(node_id));
 +            maybe_node = node.layout_parent_id().map(|node_id| node.with(node_id));
          }
- 
+
          // Return text cursor for text nodes
-@@ -3658,7 +3664,7 @@ impl BaseDocument {
+@@ -3658,7 +3684,7 @@ impl BaseDocument {
                  pos.y += cb.scroll_offset().y as f32 + viewport_scroll.y as f32;
              }
          }
 -        (pos, *self.nodes[node_id].unrounded_layout())
 +        (pos, self.nodes[node_id].unrounded_layout())
      }
- 
+
      /// Computes the size and position of the `Node` relative to the viewport
-@@ -3728,7 +3734,7 @@ impl BaseDocument {
+@@ -3728,7 +3754,7 @@ impl BaseDocument {
          };
          // Make the position relative to the offsetParent's padding edge
          if let Some(parent) = offset_parent.filter(|parent| !parent.is_static_body()) {
@@ -681,16 +755,16 @@ index 8d4090d..61145f8 100644
              let border = parent_layout.border;
              x -= (parent_pos.x + border.left) as f64;
              y -= (parent_pos.y + border.top) as f64;
-@@ -3768,7 +3774,7 @@ impl BaseDocument {
+@@ -3768,7 +3794,7 @@ impl BaseDocument {
          let inline_root = node.inline_root_ancestor()?;
- 
+
          // Fragment boxes are relative to the inline root's border box.
 -        let (root_pos, _) = self.physical_unrounded_geometry(inline_root.id);
 +        let (root_pos, _) = self.physical_unrounded_geometry(inline_root.id());
          let origin_x = root_pos.x as f64 - self.viewport_scroll().x;
          let origin_y = root_pos.y as f64 - self.viewport_scroll().y;
- 
-@@ -3788,9 +3794,8 @@ impl BaseDocument {
+
+@@ -3788,9 +3814,8 @@ impl BaseDocument {
          if root.data.is_element_with_tag_name(tag) {
              return Some(root);
          }
@@ -701,25 +775,25 @@ index 8d4090d..61145f8 100644
              .find(|child_id| {
                  self.get_node(*child_id)
                      .is_some_and(|child| child.data.is_element_with_tag_name(tag))
-@@ -3879,7 +3884,7 @@ impl BaseDocument {
+@@ -3879,7 +3904,7 @@ impl BaseDocument {
          let hit_node = self.get_node(hit.node_id)?;
          let inline_root = hit_node.inline_root_ancestor()?;
          let byte_offset = inline_root.text_offset_at_point(hit.x, hit.y)?;
 -        Some((inline_root.id, byte_offset))
 +        Some((inline_root.id(), byte_offset))
      }
- 
+
      // DOM caret from a point: the reverse of resolve_text_boundary.
-@@ -3961,7 +3966,7 @@ impl BaseDocument {
+@@ -3961,7 +3986,7 @@ impl BaseDocument {
              return (None, None);
          }
- 
+
 -        let Some(parent_id) = node.parent.get() else {
 +        let Some(parent_id) = node.parent_id() else {
              return (None, None);
          };
- 
-@@ -4034,11 +4039,11 @@ impl BaseDocument {
+
+@@ -4034,11 +4059,11 @@ impl BaseDocument {
          // nearest text position: at-or-after child k going forward
          // for a start boundary, at-or-before going backward for an
          // end boundary (matches how ranges enclose child content).
@@ -734,7 +808,7 @@ index 8d4090d..61145f8 100644
                      let n = self.get_node(text_id)?;
                      let len = match &n.data {
                          NodeData::Text(t) => t.content.chars().map(char::len_utf16).sum(),
-@@ -4048,8 +4053,8 @@ impl BaseDocument {
+@@ -4048,8 +4073,8 @@ impl BaseDocument {
                  }
              }
          } else {
@@ -745,25 +819,25 @@ index 8d4090d..61145f8 100644
                      return self.resolve_text_boundary(text_id, 0);
                  }
              }
-@@ -4066,7 +4071,7 @@ impl BaseDocument {
+@@ -4066,7 +4091,7 @@ impl BaseDocument {
          }
          node.flat_children()
              .iter()
 -            .find_map(|c| self.first_text_descendant(*c))
 +            .find_map(|c| self.first_text_descendant(c))
      }
- 
+
      fn last_text_descendant(&self, node_id: NodeId) -> Option<NodeId> {
-@@ -4077,7 +4082,7 @@ impl BaseDocument {
+@@ -4077,7 +4102,7 @@ impl BaseDocument {
          node.flat_children()
              .iter()
              .rev()
 -            .find_map(|c| self.last_text_descendant(*c))
 +            .find_map(|c| self.last_text_descendant(c))
      }
- 
+
      fn resolve_text_boundary(&self, text_id: NodeId, dom_offset: usize) -> Option<(NodeId, usize)> {
-@@ -4090,7 +4095,7 @@ impl BaseDocument {
+@@ -4090,7 +4115,7 @@ impl BaseDocument {
              NodeData::Text(t) => &t.content,
              _ => return None,
          };
@@ -772,7 +846,7 @@ index 8d4090d..61145f8 100644
          let mut hops = 0;
          while let Some(id) = cur {
              let n = self.get_node(id)?;
-@@ -4119,7 +4124,7 @@ impl BaseDocument {
+@@ -4119,7 +4144,7 @@ impl BaseDocument {
                  let end = range.end;
                  return Some((id, (range.start + byte).min(end)));
              }
@@ -781,7 +855,7 @@ index 8d4090d..61145f8 100644
              hops += 1;
              if hops > 512 {
                  return None;
-@@ -4404,7 +4409,7 @@ mod codepoint_probe_tests {
+@@ -4404,7 +4429,7 @@ mod codepoint_probe_tests {
      #[test]
      fn inserting_detached_non_latin_text_advances_the_probe_counter() {
          let mut doc = BaseDocument::new(DocumentConfig::default());
@@ -790,7 +864,7 @@ index 8d4090d..61145f8 100644
          let text_id = doc.mutate().create_text_node("漢");
          let writes_seen = doc.non_latin_text_writes();
          let cjk = &[(0x4E00, 0x9FFF)];
-@@ -4486,7 +4491,7 @@ mod author_sheet_cache_tests {
+@@ -4486,7 +4511,7 @@ mod author_sheet_cache_tests {
      #[test]
      fn removing_style_nodes_releases_their_shared_cache_entry() {
          let mut doc = BaseDocument::new(DocumentConfig::default());
@@ -799,61 +873,93 @@ index 8d4090d..61145f8 100644
          let (first, second, body) = {
              let mut mutator = doc.mutate();
              let html = mutator.create_element(qual_name!("html"), vec![]);
-@@ -4547,7 +4552,7 @@ mod hover_state_tests {
+@@ -4547,7 +4572,7 @@ mod hover_state_tests {
              viewport: Some(Viewport::new(400, 300, 1.0, ColorScheme::Light)),
              ..Default::default()
          });
 -        let root_id = doc.root_node().id;
 +        let root_id = doc.root_node().id();
          let style = |value: &str| Attribute::new(qual_name!("style"), value.to_string());
- 
+
          let mut mutator = doc.mutate();
-@@ -4635,7 +4640,7 @@ mod hover_invalidation_tests {
+@@ -4635,7 +4660,7 @@ mod hover_invalidation_tests {
              "div:hover { background-color: rgb(255, 0, 0); } div:hover span { color: rgb(0, 255, 0); }",
          );
          doc.add_user_agent_stylesheet(sheet);
 -        let root_id = doc.root_node().id;
 +        let root_id = doc.root_node().id();
          let style = |value: &str| Attribute::new(qual_name!("style"), value.to_string());
- 
+
          let mut mutator = doc.mutate();
-@@ -4720,7 +4725,7 @@ mod hover_invalidation_tests {
+@@ -4720,7 +4745,7 @@ mod hover_invalidation_tests {
              ".promo:link:hover .headline, .promo:visited:hover .headline { color: rgb(184, 0, 0); text-decoration-line: underline; }",
          );
          doc.add_user_agent_stylesheet(sheet);
 -        let root_id = doc.root_node().id;
 +        let root_id = doc.root_node().id();
          let attr = |name: QualName, value: &str| Attribute::new(name, value.to_string());
- 
+
          let mut mutator = doc.mutate();
-@@ -4787,7 +4792,7 @@ mod hover_invalidation_tests {
+@@ -4787,7 +4812,7 @@ mod hover_invalidation_tests {
              "input:checked { color: rgb(184, 0, 0); } input:checked + label { color: rgb(0, 184, 0); }",
          );
          doc.add_user_agent_stylesheet(sheet);
 -        let root_id = doc.root_node().id;
 +        let root_id = doc.root_node().id();
          let attr = |name: QualName, value: &str| Attribute::new(name, value.to_string());
- 
+
          let mut mutator = doc.mutate();
-@@ -4865,7 +4870,7 @@ mod hover_invalidation_tests {
+@@ -4865,7 +4890,7 @@ mod hover_invalidation_tests {
               div:hover::before { color: rgb(0, 0, 255); }",
          );
          doc.add_user_agent_stylesheet(sheet);
 -        let root_id = doc.root_node().id;
 +        let root_id = doc.root_node().id();
          let style = |value: &str| Attribute::new(qual_name!("style"), value.to_string());
- 
+
          let mut mutator = doc.mutate();
-@@ -4919,7 +4924,7 @@ mod hover_invalidation_tests {
+@@ -4919,7 +4944,7 @@ mod hover_invalidation_tests {
               div:hover { background-image: url(\"https://example.com/b.png\"); }",
          );
          doc.add_user_agent_stylesheet(sheet);
 -        let root_id = doc.root_node().id;
 +        let root_id = doc.root_node().id();
          let style = |value: &str| Attribute::new(qual_name!("style"), value.to_string());
- 
+
          let mut mutator = doc.mutate();
-@@ -5317,7 +5322,7 @@ mod display_none_retention_tests {
+@@ -5192,8 +5217,10 @@ impl BaseDocument {
+         use style::selector_parser::RestyleDamage;
+         let repaint_bits = RestyleDamage::REPAINT.bits();
+         let overflow_bits = RestyleDamage::RECALCULATE_OVERFLOW.bits();
+-        let mut found: Vec<(NodeId, DamageClass)> = Vec::new();
+         let mut any_construct = false;
++        let s = &mut self.damage_summary;
++        // One pass, folding as it goes: the first resolve damages every node, and collecting
++        // them first held a document-sized list that grew by doubling.
+         for (id, node) in self.nodes.iter() {
+             if !node.flags.contains(NodeFlags::IS_IN_DOCUMENT) {
+                 continue;
+@@ -5212,11 +5239,6 @@ impl BaseDocument {
+             } else {
+                 DamageClass::Layout
+             };
+-            found.push((id, class));
+-        }
+-        self.any_construct_damage = any_construct;
+-        let s = &mut self.damage_summary;
+-        for (id, class) in found {
+             let (list, overflow) = match class {
+                 DamageClass::Layout => (&mut s.layout_nodes, &mut s.layout_overflow),
+                 DamageClass::Ink => (&mut s.ink_nodes, &mut s.ink_overflow),
+@@ -5231,6 +5253,7 @@ impl BaseDocument {
+                 list.push(id);
+             }
+         }
++        self.any_construct_damage = any_construct;
+     }
+
+     /// A box that moved with no damage of its own (a sticky pin written through
+@@ -5317,7 +5340,7 @@ mod display_none_retention_tests {
              viewport: Some(Viewport::new(400, 300, 1.0, ColorScheme::Light)),
              ..Default::default()
          });
@@ -862,7 +968,7 @@ index 8d4090d..61145f8 100644
          let style = |value: &str| Attribute::new(qual_name!("style"), value.to_string());
          let mut mutator = doc.mutate();
          let html = mutator.create_element(qual_name!("html"), vec![]);
-@@ -5367,7 +5372,7 @@ mod display_none_retention_tests {
+@@ -5367,7 +5390,7 @@ mod display_none_retention_tests {
              viewport: Some(Viewport::new(400, 300, 1.0, ColorScheme::Light)),
              ..Default::default()
          });
@@ -895,7 +1001,7 @@ index d7c9d91..2f4a8f7 100644
 -        current = node.parent.get();
 +        current = node.parent_id();
      }
- 
+
      (allow_x, allow_y)
 @@ -229,7 +229,7 @@ pub(crate) fn handle_pointermove<F: FnMut(DomEvent)>(
                              if user_select == UserSelect::None {
@@ -909,7 +1015,7 @@ index d7c9d91..2f4a8f7 100644
 @@ -332,8 +332,8 @@ pub(crate) fn handle_pointermove<F: FnMut(DomEvent)>(
          return changed;
      }
- 
+
 -    let final_layout = el.layout_data().final_layout;
 -    if let SpecialElementData::TextInput(ref mut text_input_data) = el.special_data {
 +    let final_layout = el.layout_data().final_layout();
@@ -951,22 +1057,22 @@ index d7c9d91..2f4a8f7 100644
      }
 @@ -628,7 +628,7 @@ pub(crate) fn handle_click(
              };
- 
+
              let Some(el) = maybe_element else {
 -                maybe_node_id = doc.nodes[node_id].parent.get();
 +                maybe_node_id = doc.nodes[node_id].parent_id();
                  continue;
              };
- 
+
 @@ -637,7 +637,7 @@ pub(crate) fn handle_click(
                  break 'matched true;
              }
- 
+
 -            if let SpecialElementData::TextInput(_) = el.special_data {
 +            if let SpecialElementData::TextInput(_) = el.special_data() {
                  break 'matched true;
              }
- 
+
 @@ -696,12 +696,12 @@ pub(crate) fn handle_click(
                  // Activating the first <summary> of a <details> element toggles
                  // the details' `open` attribute (expand/collapse).
@@ -993,7 +1099,7 @@ index d7c9d91..2f4a8f7 100644
                          let target_node = doc.get_node_mut(target_node_id).unwrap();
 @@ -789,12 +789,12 @@ pub(crate) fn handle_click(
                      };
- 
+
                      if files.is_empty() {
 -                        el.special_data = SpecialElementData::None;
 +                        el.set_special_data(SpecialElementData::None);
@@ -1010,12 +1116,12 @@ index d7c9d91..2f4a8f7 100644
                          .expect("Text data not found");
 @@ -804,7 +804,7 @@ pub(crate) fn handle_click(
              }
- 
+
              // No match. Recurse up to parent.
 -            maybe_node_id = doc.nodes[node_id].parent.get();
 +            maybe_node_id = doc.nodes[node_id].parent_id();
          }
- 
+
          // Didn't match anything
 diff --git a/src/form.rs b/src/form.rs
 index 86f5a66..d08c05c 100644
@@ -1053,9 +1159,9 @@ index 1781a94..9f0be7f 100644
 -            node_capacity_hint: None,
          }
      }
- 
+
 diff --git a/src/layout/construct.rs b/src/layout/construct.rs
-index 0d07834..57859fb 100644
+index 0d07834..5b92f02 100644
 --- a/src/layout/construct.rs
 +++ b/src/layout/construct.rs
 @@ -439,9 +439,7 @@ impl LayoutChildren {
@@ -1067,7 +1173,7 @@ index 0d07834..57859fb 100644
 -            .push(child_id);
 +        doc.nodes[self.anonymous_table_id.unwrap()].push_child(child_id);
      }
- 
+
      fn create_anonymous_table(&mut self, container_node_id: NodeId, doc: &mut BaseDocument) {
 @@ -452,7 +450,7 @@ impl LayoutChildren {
              ns: ns!(html),
@@ -1088,11 +1194,11 @@ index 0d07834..57859fb 100644
 -            .set(Some(container_node_id));
 +        doc.nodes[node_id].set_parent_id(Some(container_node_id));
 +        doc.nodes[node_id].set_layout_parent_id(Some(container_node_id));
- 
+
          self.children.push(node_id);
          self.anonymous_blocks.push(node_id);
 @@ -497,7 +493,7 @@ impl LayoutChildren {
- 
+
      fn maybe_push_anon_block(&mut self, doc: &mut BaseDocument) {
          fn block_is_only_whitespace(doc: &BaseDocument, node_id: NodeId) -> bool {
 -            for child_id in doc.nodes[node_id].children.iter().copied() {
@@ -1109,7 +1215,7 @@ index 0d07834..57859fb 100644
 -            .push(child_id);
 +        doc.nodes[self.anonymous_block_id.unwrap()].push_child(child_id);
      }
- 
+
      fn create_anonymous_block(&mut self, container_node_id: NodeId, doc: &mut BaseDocument) {
 @@ -546,7 +540,7 @@ impl LayoutChildren {
              ns: ns!(html),
@@ -1130,7 +1236,7 @@ index 0d07834..57859fb 100644
 -            .set(Some(container_node_id));
 +        doc.nodes[node_id].set_parent_id(Some(container_node_id));
 +        doc.nodes[node_id].set_layout_parent_id(Some(container_node_id));
- 
+
          self.children.push(node_id);
          self.anonymous_block_id = Some(node_id);
 @@ -594,7 +586,7 @@ fn push_children_and_pseudos(layout_children: &mut ThinVec<NodeId>, node: &Node)
@@ -1197,7 +1303,7 @@ index 0d07834..57859fb 100644
 +    let child_ids = node.flat_children().iter().chain(pseudo_ids);
      for child_id in child_ids {
          let child = &doc.nodes[child_id];
- 
+
 @@ -841,7 +836,7 @@ fn collect_layout_children_with_wrap(
  ) {
      // Record the `display` the box is being constructed with
@@ -1205,7 +1311,7 @@ index 0d07834..57859fb 100644
 -        *doc.nodes[container_node_id].display_constructed_as_mut() = display;
 +        doc.nodes[container_node_id].set_display_constructed_as(display);
      }
- 
+
      // Reset construction flags
 @@ -895,7 +890,7 @@ fn collect_layout_children_with_wrap(
                      .data
@@ -1264,7 +1370,7 @@ index 0d07834..57859fb 100644
                      child.data.kind() == NodeKind::Element
                          && child
 @@ -1291,11 +1286,11 @@ fn flush_pseudo_elements(doc: &mut BaseDocument, node_id: NodeId) {
- 
+
          // Create pseudo element if it should exist but doesn't
          if let (None, Some(pe_style)) = (pe_node_id, &pe_style) {
 -            let new_node_id = doc.create_node(NodeData::AnonymousBlock(Box::new(
@@ -1279,7 +1385,7 @@ index 0d07834..57859fb 100644
                  doc.nodes[new_node_id]
                      .flags
 @@ -1304,8 +1299,8 @@ fn flush_pseudo_elements(doc: &mut BaseDocument, node_id: NodeId) {
- 
+
              if let Some(text) = pe_content_text_resolved(doc, node_id, idx, pe_style) {
                  let text_node_id = doc.create_text_node(&text);
 -                doc.nodes[text_node_id].parent.set(Some(new_node_id));
@@ -1351,7 +1457,7 @@ index 0d07834..57859fb 100644
 @@ -1595,15 +1587,15 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
      let placeholder_color = placeholder_look.map(|(color, _)| color);
      let placeholder_font_style = placeholder_look.map(|(_, font_style)| font_style);
- 
+
 -    if !matches!(element.special_data, SpecialElementData::TextInput(_)) {
 +    if !matches!(element.special_data(), SpecialElementData::TextInput(_)) {
          let mut text_input_data = TextInputData::new(is_multiline);
@@ -1370,15 +1476,15 @@ index 0d07834..57859fb 100644
 @@ -1618,7 +1610,7 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
          data.placeholder_font_style = placeholder_font_style;
      }
- 
+
 -    let SpecialElementData::TextInput(text_input_data) = &mut element.special_data else {
 +    let Some(SpecialElementData::TextInput(text_input_data)) = element.special_data_mut() else {
          unreachable!();
      };
- 
+
 @@ -1659,9 +1651,9 @@ fn create_checkbox_input(doc: &mut BaseDocument, input_element_id: NodeId) {
      let node = &mut doc.nodes[input_element_id];
- 
+
      let element = &mut node.data.downcast_element_mut().unwrap();
 -    if !matches!(element.special_data, SpecialElementData::CheckboxInput(_)) {
 +    if !matches!(element.special_data(), SpecialElementData::CheckboxInput(_)) {
@@ -1390,14 +1496,28 @@ index 0d07834..57859fb 100644
  }
 @@ -1719,7 +1711,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
          let node = &mut doc.nodes[node_id];
- 
+
          // Set layout_parent for node.
 -        node.layout_parent.set(Some(parent_id));
 +        node.set_layout_parent_id(Some(parent_id));
- 
+
          match &node.data {
              NodeData::Element(element_data) | NodeData::AnonymousBlock(element_data) => {
-@@ -1840,8 +1832,7 @@ pub(crate) fn build_inline_layout_into(
+@@ -1828,6 +1820,13 @@ fn bidi_wrap_chars(
+     }
+ }
+
++std::thread_local! {
++    /// The text node ranges of the root being built, reused across builds. A nested build
++    /// finds it taken and starts its own.
++    static NODE_RANGES_SCRATCH: core::cell::RefCell<Vec<(NodeId, core::ops::Range<usize>)>> =
++        const { core::cell::RefCell::new(Vec::new()) };
++}
++
+ pub(crate) fn build_inline_layout_into(
+     nodes: &crate::NodeTree,
+     layout_ctx: &mut LayoutContext<TextBrush>,
+@@ -1840,8 +1839,7 @@ pub(crate) fn build_inline_layout_into(
      let root_node = &nodes[inline_context_root_node_id];
      let root_node_style = root_node.primary_styles().or_else(|| {
          root_node
@@ -1406,8 +1526,18 @@ index 0d07834..57859fb 100644
 +            .parent_id()
              .and_then(|parent_id| nodes[parent_id].primary_styles())
      });
- 
-@@ -1916,7 +1907,7 @@ pub(crate) fn build_inline_layout_into(
+
+@@ -1904,7 +1902,8 @@ pub(crate) fn build_inline_layout_into(
+
+     // Per-text-node byte ranges for the DOM-selection
+     // paint bridge; measured around each push (see TextLayout).
+-    let node_ranges: &mut Vec<(NodeId, core::ops::Range<usize>)> = &mut Vec::new();
++    let mut node_ranges_buf = NODE_RANGES_SCRATCH.with(core::cell::RefCell::take);
++    let node_ranges = &mut node_ranges_buf;
+
+     if let Some(before_id) = root_node.before() {
+         build_inline_layout_recursive(
+@@ -1916,7 +1915,7 @@ pub(crate) fn build_inline_layout_into(
              node_ranges,
          );
      }
@@ -1416,7 +1546,19 @@ index 0d07834..57859fb 100644
          build_inline_layout_recursive(
              &mut builder,
              &mut text_transformer,
-@@ -2002,7 +1993,7 @@ pub(crate) fn build_inline_layout_into(
+@@ -1938,7 +1937,10 @@ pub(crate) fn build_inline_layout_into(
+     }
+
+     let text = builder.build_into(text_layout.layout_for_build());
+-    text_layout.set_content(text, core::mem::take(node_ranges));
++    // An exact copy, so the scratch keeps its capacity for the next root.
++    text_layout.set_content(text, node_ranges_buf.as_slice().to_vec());
++    node_ranges_buf.clear();
++    NODE_RANGES_SCRATCH.with(|scratch| scratch.replace(node_ranges_buf));
+     return;
+
+     fn build_inline_layout_recursive(
+@@ -2002,7 +2004,7 @@ pub(crate) fn build_inline_layout_into(
                                  .as_ref()
                                  .map_or(&[][..], |styles| styles.as_slice()),
                          );
@@ -1425,19 +1567,33 @@ index 0d07834..57859fb 100644
                              // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                              build_inline_layout_recursive(
                                  builder,
-@@ -2067,7 +2058,7 @@ pub(crate) fn build_inline_layout_into(
+@@ -2065,15 +2067,15 @@ pub(crate) fn build_inline_layout_into(
+                             });
+
                              // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-                             let style = node
-                                 .primary_styles()
+-                            let style = node
+-                                .primary_styles()
 -                                .map(|s| stylo_to_parley::style(node.id, &s))
-+                                .map(|s| stylo_to_parley::style(node.id(), &s))
-                                 .unwrap_or_else(|| parley::TextStyle {
+-                                .unwrap_or_else(|| parley::TextStyle {
++                            match node.primary_styles() {
++                                Some(s) => builder.push_style_span(
++                                    stylo_to_parley::style_borrowed(node.id(), &s),
++                                ),
++                                None => builder.push_style_span(parley::TextStyle {
                                      white_space_collapse: WhiteSpaceCollapse::Collapse,
                                      ..Default::default()
-@@ -2090,7 +2081,7 @@ pub(crate) fn build_inline_layout_into(
+-                                });
+-
+-                            builder.push_style_span(style);
++                                }),
++                            }
+
+                             if let Some((open, _)) = bidi_wrap {
+                                 builder.push_text(open);
+@@ -2090,7 +2092,7 @@ pub(crate) fn build_inline_layout_into(
                                  );
                              }
- 
+
 -                            for child_id in node.flat_children().iter().copied() {
 +                            for child_id in node.flat_children().iter() {
                                  build_inline_layout_recursive(
@@ -1462,7 +1618,7 @@ index 9c3f1b6..62c864a 100644
                  }
              }
 @@ -470,7 +470,7 @@ impl BaseDocument {
- 
+
          let mut out = CounterOutput::default();
          let mut state = CounterState::default();
 -        let root = self.root_element().id;
@@ -1477,17 +1633,17 @@ index 9c3f1b6..62c864a 100644
 -            dirty.extend(self.nodes.get(id).and_then(|node| node.parent.get()));
 +            dirty.extend(self.nodes.get(id).and_then(|node| node.parent_id()));
          }
- 
+
          dirty.retain(|&id| self.nodes.get(id).is_some());
 @@ -705,7 +705,7 @@ impl BaseDocument {
- 
+
          // Flat-tree children: slot assignment and shadow roots reorder
          // content, and counters follow the rendered (flat) order.
 -        for &child in self.nodes[node_id].flat_children() {
 +        for child in self.nodes[node_id].flat_children() {
              self.resolve_counters_for(child, depth + 1, state, out);
          }
- 
+
 diff --git a/src/layout/damage.rs b/src/layout/damage.rs
 index 9cf944d..5f74b04 100644
 --- a/src/layout/damage.rs
@@ -1508,7 +1664,7 @@ index 9cf944d..5f74b04 100644
 +            self.nodes[node_id].restore_detached_children(children);
              return damage;
          }
- 
+
 @@ -85,11 +85,11 @@ impl BaseDocument {
          // may skip a display:none child, and then nothing revisits its subtree.
          if own_damage.contains(CONSTRUCT_BOX) {
@@ -1525,7 +1681,7 @@ index 9cf944d..5f74b04 100644
          }
 @@ -106,9 +106,9 @@ impl BaseDocument {
          }
- 
+
          let mut damage_from_children = RestyleDamage::empty();
 -        let children = std::mem::take(&mut self.nodes[node_id].children);
 -        for child in children.iter() {
@@ -1538,11 +1694,11 @@ index 9cf944d..5f74b04 100644
              damage_from_children |= self.propagate_damage_flags(before_id);
 @@ -144,7 +144,7 @@ impl BaseDocument {
          damage |= damage_from_children;
- 
+
          // Put children back
 -        self.nodes[node_id].children = children;
 +        self.nodes[node_id].restore_detached_children(children);
- 
+
          if damage.contains(CONSTRUCT_BOX) {
              damage.insert(RestyleDamage::RELAYOUT);
 @@ -224,13 +224,13 @@ impl BaseDocument {
@@ -1560,10 +1716,10 @@ index 9cf944d..5f74b04 100644
 +                current = ancestor.layout_parent_id();
              }
          }
- 
+
 @@ -359,7 +359,7 @@ impl BaseDocument {
      }
- 
+
      /// Mark every node in the document with `ALL_DAMAGE` (non-incremental
 -    /// mode). Iterates the node slotmap directly rather than walking the tree,
 +    /// mode). Iterates the node slab directly rather than walking the tree,
@@ -1577,7 +1733,7 @@ index 9cf944d..5f74b04 100644
 -        let children = std::mem::take(&mut node.children);
 +        let children = node.take_detached_children();
          let (before, after) = (node.before(), node.after());
- 
+
          for anon_id in anonymous_blocks.iter() {
              self.clear_damage_and_dirty_flags(*anon_id);
          }
@@ -1590,7 +1746,7 @@ index 9cf944d..5f74b04 100644
          }
          if let Some(before_id) = before {
 @@ -424,7 +424,7 @@ impl BaseDocument {
- 
+
          let node = &mut self.nodes[node_id];
          node.set_anonymous_blocks(anonymous_blocks);
 -        node.children = children;
@@ -1606,7 +1762,7 @@ index 9cf944d..5f74b04 100644
 +                at = node.layout_parent_id().or(node.parent_id());
              }
          }
- 
+
 @@ -667,7 +667,7 @@ impl BaseDocument {
              let node = &mut self.nodes[id];
              node.insert_damage(ALL_DAMAGE);
@@ -1627,17 +1783,151 @@ index 9cf944d..5f74b04 100644
                  input.editor.set_scale(scale);
 @@ -723,7 +723,7 @@ impl BaseDocument {
          }
- 
+
          for node_id in anon_nodes {
 -            if let Some(parent_id) = self.nodes[node_id].layout_parent.get() {
 +            if let Some(parent_id) = self.nodes[node_id].layout_parent_id() {
                  self.nodes[parent_id].insert_damage(ALL_DAMAGE);
              }
          }
+diff --git a/src/layout/evict.rs b/src/layout/evict.rs
+index 45702d8..c962229 100644
+--- a/src/layout/evict.rs
++++ b/src/layout/evict.rs
+@@ -10,7 +10,9 @@
+ //! after, so no pass holds the shaped text of the whole document at once.
+
+ use crate::BaseDocument;
+-use crate::node::{EvictedBreak, EvictedLayout, EvictedSummary, SummaryCell};
++use crate::node::{
++    AlignInputs, EvictedBreak, EvictedLayout, EvictedSummary, OutOfFlow, StaticX, SummaryCell,
++};
+ use blitz_traits::node_id::NodeId;
+ use style::values::specified::box_::DisplayOutside;
+
+@@ -113,20 +115,18 @@ impl BaseDocument {
+         let Some(lines) = layout.break_summary() else {
+             return Eviction::Unsummarized;
+         };
+-        // A summary holds only absolutely positioned boxes, and only the line
+-        // each lands on.
++        // A summary holds only absolutely positioned boxes, the line each
++        // lands on, and where along it when their static position needs that.
+         let out_of_flow: Box<[NodeId]> = layout
+             .inline_boxes()
+             .map(|ibox| NodeId::from_u64(ibox.id))
+             .collect();
+-        if !out_of_flow.is_empty()
+-            && (is_vertical(&self.nodes[node_id])
+-                || !out_of_flow
+-                    .iter()
+-                    .all(|&id| self.abspos_static_x_is_unused(id)))
+-        {
++        if !out_of_flow.is_empty() && is_vertical(&self.nodes[node_id]) {
+             return Eviction::Unsummarized;
+         }
++        let needs_static_x = !out_of_flow
++            .iter()
++            .all(|&id| self.abspos_static_x_is_unused(id));
+         let clamp_lines = self.inline_clamp_lines(node_id);
+         let (_, last_line_alignment) = self.inline_alignment(node_id);
+         let inline = self
+@@ -136,11 +136,28 @@ impl BaseDocument {
+         let max_advance = layout.layout_max_advance();
+         let indent = layout.text_indent();
+         let alignment = layout.alignment();
++        let static_x = if needs_static_x {
++            let Some(x) = static_x_of(layout, &out_of_flow) else {
++                return Eviction::Unsummarized;
++            };
++            let aligned = AlignInputs {
++                max_advance,
++                indent,
++                alignment,
++                last_line_alignment,
++                clamp_lines,
++            };
++            Some(StaticX { aligned, x })
++        } else {
++            None
++        };
+         let boxes = layout
+             .inline_boxes()
+             .map(|ibox| (ibox.width, ibox.height, ibox.baseline))
+             .collect();
+         // Content widths the layout pass measured stay in `inline.content_widths`.
++        let out_of_flow = (!out_of_flow.is_empty())
++            .then(|| Box::new(OutOfFlow { ids: out_of_flow, static_x }));
+         let summary = Some(EvictedSummary { lines, out_of_flow });
+         let breaking = EvictedBreak::new(
+             max_advance,
+@@ -223,12 +240,12 @@ impl BaseDocument {
+         if self.inline_layout_eviction_viewports.is_none() {
+             return;
+         }
+-        self.inline_pass_seq = self.inline_pass_seq.wrapping_add(1);
++        self.inline_pass_seq = self.inline_pass_seq.wrapping_add(1) & !crate::node::TextLayout::ROOT_INDEXED;
+         let seq = self.inline_pass_seq;
+         let Some(inline) = self.inline_layout_mut(node_id) else {
+             return;
+         };
+-        inline.in_pass_seq = seq;
++        inline.set_in_pass_seq(seq);
+         self.inline_pass_window.push_back((node_id, seq));
+         if self.inline_pass_window.len() > IN_PASS_WINDOW {
+             let (id, seq) = self.inline_pass_window.pop_front().expect("over capacity");
+@@ -251,7 +268,7 @@ impl BaseDocument {
+         // out from its break summary and never rebuilt.
+         if self
+             .inline_layout_mut(id)
+-            .is_none_or(|inline| inline.in_pass_seq != seq || inline.is_evicted())
++            .is_none_or(|inline| inline.in_pass_seq() != seq || inline.is_evicted())
+         {
+             return;
+         }
+@@ -386,6 +403,29 @@ impl BaseDocument {
+ }
+
+ /// Whether `node` lays out in a vertical writing mode.
++/// Each box's offset along its line in `layout`, in `ids` order, or `None`
++/// when one was clamped away. Looked up by id: bidi lines list items visually.
++fn static_x_of(
++    layout: &parley::layout::Layout<crate::node::TextBrush>,
++    ids: &[NodeId],
++) -> Option<Box<[f32]>> {
++    let mut placed: Vec<(u64, f32)> = layout
++        .lines()
++        .flat_map(|line| line.items())
++        .filter_map(|item| match item {
++            parley::layout::PositionedLayoutItem::InlineBox(ibox) => Some((ibox.id, ibox.x)),
++            parley::layout::PositionedLayoutItem::GlyphRun(_) => None,
++        })
++        .collect();
++    placed.sort_unstable_by_key(|&(id, _)| id);
++    ids.iter()
++        .map(|id| {
++            let at = placed.binary_search_by_key(&id.as_u64(), |&(id, _)| id).ok()?;
++            Some(placed[at].1)
++        })
++        .collect()
++}
++
+ pub(super) fn is_vertical(node: &crate::Node) -> bool {
+     #[cfg(feature = "writing-mode")]
+     return node.writing_mode().is_vertical();
 diff --git a/src/layout/inline.rs b/src/layout/inline.rs
-index 95e7df8..c6a7d82 100644
+index 95e7df8..f8e5372 100644
 --- a/src/layout/inline.rs
 +++ b/src/layout/inline.rs
+@@ -22,7 +22,7 @@ use stylo_taffy::StyleFlags;
+
+ use super::resolve_calc_value;
+ use crate::layout::LayoutPassState;
+-use crate::node::{TextBrush, count_inline_summary};
++use crate::node::{TextBrush, TextLayout, count_inline_summary};
+ use crate::stylo_to_parley;
+
+ /// Subtract a child's margins from the definite axes of the available space it is laid out in.
 @@ -293,11 +293,11 @@ impl LayoutPassState<'_> {
          // The spans of an anonymous inline root are descendants of its parent
          let root_parent = root
@@ -1645,7 +1935,7 @@ index 95e7df8..c6a7d82 100644
 -            .then_some(root.parent.get())
 +            .then_some(root.parent_id())
              .flatten();
- 
+
          let mut flags = StyleFlags::empty();
 -        let mut current = self.nodes[box_id].parent.get();
 +        let mut current = self.nodes[box_id].parent_id();
@@ -1661,6 +1951,66 @@ index 95e7df8..c6a7d82 100644
          }
          StyleFlags::empty()
      }
+@@ -448,17 +448,11 @@ impl LayoutPassState<'_> {
+                 Some(layout) => layout.inline_boxes().len() == 0,
+                 None => inline_layout
+                     .evicted_summary()
+-                    .is_none_or(|summary| summary.out_of_flow.is_empty()),
++                    .is_none_or(|summary| summary.out_of_flow.is_none()),
+             }
+         {
+             inline_layout.replayable_break = false;
+-            // Put layout back
+-            self.nodes[node_id]
+-                .data
+-                .downcast_element_mut()
+-                .unwrap()
+-                .set_inline_layout_data(Some(inline_layout));
+-            self.inline_roots.push(node_id);
++            self.put_back_inline_layout(node_id, inline_layout);
+             return LayoutOutput::from_outer_size(
+                 Size::ZERO.maybe_max(container_pb.sum_axes().map(Some)),
+             );
+@@ -785,13 +779,7 @@ impl LayoutPassState<'_> {
+             if !inline_layout.is_evicted() {
+                 inline_layout.replayable_break = false;
+             }
+-            // Put layout back
+-            self.nodes[node_id]
+-                .data
+-                .downcast_element_mut()
+-                .unwrap()
+-                .set_inline_layout_data(Some(inline_layout));
+-            self.inline_roots.push(node_id);
++            self.put_back_inline_layout(node_id, inline_layout);
+
+             let measured_size = inputs.known_dimensions.unwrap_or(taffy::Size {
+                 width: width.ceil() / scale,
+@@ -828,11 +816,23 @@ impl LayoutPassState<'_> {
+             );
+             #[cfg(not(feature = "floats"))]
+             let clear_of_floats = true;
++            // Boxes whose static position needs their place along the line
++            // reuse the recorded one only when it is what aligning these lines
++            // again gives; a measure pass places no boxes.
+             let summary = inline_layout
+                 .evicted_summary()
+                 .filter(|summary| {
++                    let static_x = summary.out_of_flow.as_deref().and_then(|oof| oof.static_x.as_ref());
+                     !super::evict::is_vertical(&self.nodes[node_id])
+-                        && summary.out_of_flow.iter().all(|&id| self.abspos_static_x_is_unused(id))
++                        && (summary
++                            .out_of_flow_ids()
++                            .iter()
++                            .all(|&id| self.abspos_static_x_is_unused(id))
++                            || static_x.is_some_and(|static_x| {
++                                inputs.run_mode != RunMode::PerformLayout
++                                    || static_x.aligned
++                                        == self.inline_align_inputs(node_id, width, indent)
++                            }))
+                 })
+                 .map(|summary| &summary.lines)
+                 .filter(|_| clear_of_floats);
 @@ -1034,10 +1034,12 @@ impl LayoutPassState<'_> {
                              x: pos.x + margin.left + container_pb.left + relative_inset.x,
                              y: pos.y + margin.top + container_pb.top + relative_inset.y,
@@ -1672,10 +2022,45 @@ index 95e7df8..c6a7d82 100644
                          layout.location = location;
                          layout.margin = margin;
 +                        float_node.set_unrounded_layout(&layout);
- 
+
                          // Translate anchors from item-relative to container-relative
                          // coordinates and collect candidates bubbled from the float's subtree
-@@ -1335,10 +1337,12 @@ impl LayoutPassState<'_> {
+@@ -1223,7 +1225,8 @@ impl LayoutPassState<'_> {
+         // and it clips away.
+         let commit_positions = inputs.run_mode == taffy::RunMode::PerformLayout;
+         // A summarized root's inline boxes are all absolutely positioned, with
+-        // static positions that need only their line (see eviction).
++        // static positions that need only their line, or recorded offsets
++        // along it that the summary check found current (see eviction).
+         if let (true, Some(lines), Some(summary)) = (
+             commit_positions,
+             &summary_lines,
+@@ -1233,7 +1236,9 @@ impl LayoutPassState<'_> {
+                 start: container_pb.left,
+                 end: final_size.width - container_pb.right,
+             };
+-            for (&box_id, &line) in summary.out_of_flow.iter().zip(lines.box_lines()) {
++            let static_x = summary.out_of_flow.as_deref().and_then(|oof| oof.static_x.as_ref());
++            let ids = summary.out_of_flow_ids();
++            for (index, (&box_id, &line)) in ids.iter().zip(lines.box_lines()).enumerate() {
+                 // Clamped away: the missing-box pass below offers it.
+                 let Some(line) = lines.lines().get(line as usize) else {
+                     continue;
+@@ -1243,8 +1248,11 @@ impl LayoutPassState<'_> {
+                     box_id,
+                     ibox_order,
+                     AbsposLine {
+-                        // Unused: eviction requires a horizontal inset.
+-                        x: container_pb.left,
++                        // Without recorded offsets every box has a horizontal
++                        // inset or is block-level, so this is unused.
++                        x: static_x.map_or(container_pb.left, |static_x| {
++                            (static_x.x[index] / scale) + container_pb.left
++                        }),
+                         top: (line.block_min_coord / scale) + line_box_top,
+                         bottom: (line.block_max_coord / scale) + line_box_top,
+                     },
+@@ -1335,10 +1343,12 @@ impl LayoutPassState<'_> {
                              container_direction,
                          ));
                      } else if is_floated {
@@ -1689,23 +2074,86 @@ index 95e7df8..c6a7d82 100644
                      } else {
                          // Re-measure the box to get its border-box size (this hits the layout
                          // cache). The size cannot be recovered from `ibox` dimensions as the
-@@ -1362,7 +1366,7 @@ impl LayoutPassState<'_> {
+@@ -1362,7 +1372,7 @@ impl LayoutPassState<'_> {
                              taffy::Point::ZERO
                          };
- 
+
 -                        let layout = node.unrounded_layout_mut();
 +                        let mut layout = node.unrounded_layout();
                          layout.size = size;
                          layout.scrollable_overflow_rect = output.scrollable_overflow_rect;
                          layout.location.x =
-@@ -1374,6 +1378,7 @@ impl LayoutPassState<'_> {
+@@ -1374,6 +1384,7 @@ impl LayoutPassState<'_> {
                          layout.padding = padding; //.map(|p| p / scale);
                          layout.border = border; //.map(|p| p / scale);
                          layout.margin = margin;
 +                        node.set_unrounded_layout(&layout);
- 
+
                          // Translate anchors from item-relative to container-relative
                          // coordinates and collect candidates bubbled from the box's subtree
+@@ -1469,13 +1480,7 @@ impl LayoutPassState<'_> {
+             inline_layout.span_cb_flags = span_cb_flags;
+         }
+
+-        // Put layout back
+-        self.nodes[node_id]
+-            .data
+-            .downcast_element_mut()
+-            .unwrap()
+-            .set_inline_layout_data(Some(inline_layout));
+-        self.inline_roots.push(node_id);
++        self.put_back_inline_layout(node_id, inline_layout);
+         // A measure that broke lines shapes the root as a final layout does:
+         // a flex item measures its whole subtree before laying any of it out.
+         self.evict_inline_layout_after_break(node_id);
+@@ -1617,6 +1622,22 @@ fn f32_max(a: f32, b: f32) -> f32 {
+ }
+
+ impl crate::BaseDocument {
++    /// Puts an inline root's layout back after a layout pass and indexes the root once. Each
++    /// measure and layout of a root used to push it again, so the index of a large page grew to
++    /// several times its root count before resolve deduplicated it.
++    pub(crate) fn put_back_inline_layout(&mut self, node_id: NodeId, mut layout: Box<TextLayout>) {
++        let push = !layout.mark_root_indexed();
++        self.nodes[node_id]
++            .data
++            .downcast_element_mut()
++            .unwrap()
++            .set_inline_layout_data(Some(layout));
++        if push {
++            self.inline_roots.push(node_id);
++        }
++        self.inline_roots_put = true;
++    }
++
+     // Re-break a container's text to a width it already
+     // committed to, without re-running layout. Repairing at the parley
+     // level is deliberate: replaying `compute_inline_layout` would need
+@@ -1670,6 +1691,24 @@ impl crate::BaseDocument {
+
+     // -webkit-box + orient:vertical + line-clamp:N was rewritten to
+     // flow-root at computed-value time; the stylo flag says clamp here.
++    /// The [`AlignInputs`] a pass breaking `node_id` at `width` (layout
++    /// units) with `indent` aligns its lines with.
++    fn inline_align_inputs(
++        &self,
++        node_id: NodeId,
++        width: f32,
++        indent: (f32, parley::IndentOptions),
++    ) -> crate::node::AlignInputs {
++        let (alignment, last_line_alignment) = self.inline_alignment(node_id);
++        crate::node::AlignInputs {
++            max_advance: width,
++            indent,
++            alignment: Some(alignment),
++            last_line_alignment,
++            clamp_lines: self.inline_clamp_lines(node_id),
++        }
++    }
++
+     pub(crate) fn inline_clamp_lines(&self, node_id: NodeId) -> Option<usize> {
+         self.nodes[node_id].primary_styles().and_then(|s| {
+             use style::computed_value_flags::ComputedValueFlags;
 diff --git a/src/layout/list.rs b/src/layout/list.rs
 index 4ec047b..2ecfe8f 100644
 --- a/src/layout/list.rs
@@ -1724,7 +2172,7 @@ index d0a5f00..2c082c0 100644
 --- a/src/layout/mod.rs
 +++ b/src/layout/mod.rs
 @@ -125,7 +125,7 @@ impl<'doc> LayoutPassState<'doc> {
- 
+
      pub(crate) fn new(doc: &'doc mut BaseDocument) -> Self {
          #[cfg(feature = "writing-mode")]
 -        let root_id = doc.try_root_element().map(|root| root.id);
@@ -1734,7 +2182,7 @@ index d0a5f00..2c082c0 100644
              root_wm: root_id.map_or(stylo_taffy::WritingMode::empty(), |id| {
 @@ -405,7 +405,7 @@ impl LayoutPassState<'_> {
                      };
- 
+
                      // Get the element's intrinsic dimensions and default object size
 -                    let (intrinsic_sizes, default_object_size) = match &element_data.special_data {
 +                    let (intrinsic_sizes, default_object_size) = match element_data.special_data() {
@@ -1744,7 +2192,7 @@ index d0a5f00..2c082c0 100644
 @@ -545,11 +545,11 @@ impl LayoutPassState<'_> {
                              inputs.available_space.maybe_min(max_available_space);
                      }
- 
+
 -                    let SpecialElementData::TableRoot(context) = &self.nodes[dom_node_id(node_id)]
 +                    let SpecialElementData::TableRoot(context) = self.nodes[dom_node_id(node_id)]
                          .data
@@ -1765,16 +2213,16 @@ index d0a5f00..2c082c0 100644
 -        *self.node_from_id_mut(node_id).unrounded_layout_mut() = *layout;
 +        self.node_from_id_mut(node_id).set_unrounded_layout(layout);
      }
- 
+
      fn resolve_calc_value(&self, calc_ptr: *const (), parent_size: f32) -> f32 {
 @@ -959,12 +959,12 @@ impl taffy::LayoutGridContainer for LayoutPassState<'_> {
- 
+
  impl RoundTree for LayoutPassState<'_> {
      fn get_unrounded_layout(&self, node_id: NodeId) -> Layout {
 -        *self.node_from_id(node_id).unrounded_layout()
 +        self.node_from_id(node_id).unrounded_layout()
      }
- 
+
      fn set_final_layout(&mut self, node_id: NodeId, layout: &Layout) {
          let layout_data = self.node_from_id_mut(node_id).layout_data_mut();
 -        layout_data.final_layout = *layout;
@@ -1784,13 +2232,13 @@ index d0a5f00..2c082c0 100644
          layout_data.set_pin_offset(taffy::Point { x: 0.0, y: 0.0 });
 @@ -1060,7 +1060,7 @@ impl PrintTree for TaffyDebugTree<'_> {
      }
- 
+
      fn get_final_layout(&self, node_id: NodeId) -> Layout {
 -        *self.node_from_id(node_id).final_layout()
 +        self.node_from_id(node_id).final_layout()
      }
  }
- 
+
 diff --git a/src/layout/paint_tree.rs b/src/layout/paint_tree.rs
 index 358c3f6..b6b53ac 100644
 --- a/src/layout/paint_tree.rs
@@ -1851,10 +2299,21 @@ index 358c3f6..b6b53ac 100644
                  return Some(current);
              }
 diff --git a/src/layout/table.rs b/src/layout/table.rs
-index 7df5fda..eddf5fe 100644
+index 7df5fda..c3b7569 100644
 --- a/src/layout/table.rs
 +++ b/src/layout/table.rs
-@@ -239,7 +239,7 @@ impl TableRow {
+@@ -63,7 +63,10 @@ pub struct TableContext {
+     caption_margin_adjustments: Vec<Arc<CaptionMarginAdjustment>>,
+ }
+
++// Taffy's CompactLength keeps a tag in the low three bits of a calc pointer, and this is passed
++// as one, so it must be 8-aligned on 32-bit targets too rather than relying on the allocator.
+ #[derive(Debug)]
++#[repr(align(8))]
+ struct CaptionMarginAdjustment {
+     value: taffy::LengthPercentageAuto,
+     spacing: f32,
+@@ -239,7 +242,7 @@ impl TableRow {
  fn table_wm(doc: &BaseDocument, table_root_node_id: NodeId) -> WritingMode {
      #[cfg(feature = "writing-mode")]
      {
@@ -1863,17 +2322,17 @@ index 7df5fda..eddf5fe 100644
              doc.root_layout_wm(table_root_node_id)
          } else {
              doc.nodes[table_root_node_id].writing_mode()
-@@ -370,7 +370,7 @@ pub(crate) fn build_table_context(
+@@ -370,7 +373,7 @@ pub(crate) fn build_table_context(
      let wm = table_wm(doc, table_root_node_id);
      let root_node = &mut doc.nodes[table_root_node_id];
- 
+
 -    let children = std::mem::take(&mut root_node.children);
 +    let children = root_node.take_detached_children();
- 
+
      let Some(stylo_styles) = root_node.primary_styles() else {
          panic!("Ignoring table because it has no styles");
-@@ -401,7 +401,7 @@ pub(crate) fn build_table_context(
- 
+@@ -401,7 +404,7 @@ pub(crate) fn build_table_context(
+
      let mut columns: Vec<TableColumn> = Vec::new();
      let mut column_sizes: Vec<taffy::TrackSizingFunction> = Vec::new();
 -    for child_id in children.iter().copied() {
@@ -1881,7 +2340,7 @@ index 7df5fda..eddf5fe 100644
          collect_columns(doc, child_id, wm, &mut columns, &mut column_sizes);
      }
      // Percentage column widths only take effect in the fixed table layout algorithm
-@@ -429,7 +429,7 @@ pub(crate) fn build_table_context(
+@@ -429,7 +432,7 @@ pub(crate) fn build_table_context(
      };
      let mut stray_run = false;
      for order in 0..3 {
@@ -1890,16 +2349,16 @@ index 7df5fda..eddf5fe 100644
              if row_group_order(doc, child_id) != order {
                  continue;
              }
-@@ -605,7 +605,7 @@ pub(crate) fn build_table_context(
+@@ -605,7 +608,7 @@ pub(crate) fn build_table_context(
          .chain(oof_children.iter().map(|(node_id, _)| *node_id))
          .collect();
      let root_node = &mut doc.nodes[table_root_node_id];
 -    root_node.children = children;
 +    root_node.restore_detached_children(children);
- 
+
      (
          TableContext {
-@@ -649,11 +649,11 @@ fn collect_columns(
+@@ -649,11 +652,11 @@ fn collect_columns(
      match display.inside() {
          DisplayInside::TableColumnGroup => {
              let first_column = columns.len();
@@ -1914,7 +2373,7 @@ index 7df5fda..eddf5fe 100644
              for column in &mut columns[first_column..] {
                  column.group.get_or_insert(node_id);
              }
-@@ -756,9 +756,9 @@ fn collect_table_cells(
+@@ -756,9 +759,9 @@ fn collect_table_cells(
          | DisplayInside::Contents => {
              let first_row = rows.len();
              *stray_run = false;
@@ -1926,7 +2385,7 @@ index 7df5fda..eddf5fe 100644
                  doc.nodes[child_id]
                      .remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                  collect_table_cells(
-@@ -779,7 +779,7 @@ fn collect_table_cells(
+@@ -779,7 +782,7 @@ fn collect_table_cells(
                      &mut group_stray,
                  );
              }
@@ -1935,10 +2394,10 @@ index 7df5fda..eddf5fe 100644
              if display.inside() != DisplayInside::Contents {
                  for row in &mut rows[first_row..] {
                      row.group.get_or_insert(node_id);
-@@ -803,9 +803,9 @@ fn collect_table_cells(
+@@ -803,9 +806,9 @@ fn collect_table_cells(
                  is_constrained: height.is_some(),
              });
- 
+
 -            let children = std::mem::take(&mut doc.nodes[node_id].children);
 +            let children = doc.nodes[node_id].take_detached_children();
              let mut row_stray = false;
@@ -1947,7 +2406,7 @@ index 7df5fda..eddf5fe 100644
                  collect_table_cells(
                      doc,
                      child_id,
-@@ -824,7 +824,7 @@ fn collect_table_cells(
+@@ -824,7 +827,7 @@ fn collect_table_cells(
                      &mut row_stray,
                  );
              }
@@ -1989,7 +2448,7 @@ index edf4600..1ba7efa 100644
 -            return (pos, *self.nodes[node_id].unrounded_layout());
 +            return (pos, self.nodes[node_id].unrounded_layout());
          }
- 
+
 -        let root_id = self.try_root_element().map(|root| root.id);
 +        let root_id = self.try_root_element().map(|root| root.id());
          let node = &self.nodes[node_id];
@@ -2005,14 +2464,14 @@ index 5bfa868..a0547b3 100644
 +++ b/src/lib.rs
 @@ -40,6 +40,7 @@ mod document;
  pub mod node;
- 
+
  mod config;
 +pub mod pool;
  /// CSSOM stylesheet access (`document.styleSheets`, `CSSStyleSheet`, `CSSRule`)
  mod cssom;
  mod css_compat;
 diff --git a/src/mutator.rs b/src/mutator.rs
-index b7ef9af..131a205 100644
+index 3f042ee..a1231ae 100644
 --- a/src/mutator.rs
 +++ b/src/mutator.rs
 @@ -63,7 +63,7 @@ fn is_template_inert_context(doc: &BaseDocument, node_id: NodeId) -> bool {
@@ -2026,37 +2485,37 @@ index b7ef9af..131a205 100644
  }
 @@ -138,27 +138,27 @@ impl DocumentMutator<'_> {
      // Query methods
- 
+
      pub fn node_has_parent(&self, node_id: NodeId) -> bool {
 -        self.doc.nodes[node_id].parent.get().is_some()
 +        self.doc.nodes[node_id].parent_id().is_some()
      }
- 
+
      pub fn previous_sibling_id(&self, node_id: NodeId) -> Option<NodeId> {
 -        self.doc.nodes[node_id].backward(1).map(|node| node.id)
 +        self.doc.nodes[node_id].backward(1).map(|node| node.id())
      }
- 
+
      pub fn next_sibling_id(&self, node_id: NodeId) -> Option<NodeId> {
 -        self.doc.nodes[node_id].forward(1).map(|node| node.id)
 +        self.doc.nodes[node_id].forward(1).map(|node| node.id())
      }
- 
+
      pub fn parent_id(&self, node_id: NodeId) -> Option<NodeId> {
 -        self.doc.nodes[node_id].parent.get()
 +        self.doc.nodes[node_id].parent_id()
      }
- 
+
      pub fn last_child_id(&self, node_id: NodeId) -> Option<NodeId> {
 -        self.doc.nodes[node_id].children.last().copied()
 +        self.doc.nodes[node_id].children().last()
      }
- 
+
      pub fn child_ids(&self, node_id: NodeId) -> ThinVec<NodeId> {
 -        self.doc.nodes[node_id].children.clone()
 +        self.doc.nodes[node_id].children().iter().collect()
      }
- 
+
      /// The element at `node_id`, whose name the parser reads through it.
 @@ -169,10 +169,13 @@ impl DocumentMutator<'_> {
      pub fn node_at_path(&self, start_node_id: NodeId, path: &[u8]) -> NodeId {
@@ -2072,27 +2531,36 @@ index b7ef9af..131a205 100644
 -        current.id
 +        current.id()
      }
- 
+
      // Node creation methods
-@@ -191,7 +194,7 @@ impl DocumentMutator<'_> {
+@@ -187,11 +190,15 @@ impl DocumentMutator<'_> {
+         self.doc.create_text_node(text)
+     }
+
+-    pub fn create_element(&mut self, name: QualName, attrs: Vec<Attribute>) -> NodeId {
++    pub fn create_element(
++        &mut self,
++        name: QualName,
++        attrs: impl Into<crate::node::Attributes>,
++    ) -> NodeId {
          let mut data = ElementData::new(name, attrs);
          data.flush_style_attribute(self.doc.guard(), &self.doc.url.url_extra_data());
- 
+
 -        let id = self.doc.create_node(NodeData::Element(Box::new(data)));
 +        let id = self.doc.create_node(NodeData::Element(crate::pool::PoolBox::new(data)));
          let node = self.doc.get_node_mut(id).unwrap();
- 
+
          // Initialise style data
-@@ -281,7 +284,7 @@ impl DocumentMutator<'_> {
+@@ -281,7 +288,7 @@ impl DocumentMutator<'_> {
              // Mark ancestors dirty so the style traversal visits this subtree.
              // Without this, the traversal may skip nodes with pending damage.
              node.mark_ancestors_dirty();
 -            let parent_id = node.parent.get();
 +            let parent_id = node.parent_id();
- 
+
              // Also insert damage on the parent element, since text content changes
              // affect the parent's layout (text may wrap differently, change size, etc.)
-@@ -367,7 +370,7 @@ impl DocumentMutator<'_> {
+@@ -367,7 +374,7 @@ impl DocumentMutator<'_> {
              {
                  svg_root = Some(id);
              }
@@ -2101,9 +2569,9 @@ index b7ef9af..131a205 100644
          }
          if let Some(id) = svg_root {
              self.doc.nodes[id].insert_damage(CONSTRUCT_BOX);
-@@ -385,8 +388,7 @@ impl DocumentMutator<'_> {
+@@ -385,8 +392,7 @@ impl DocumentMutator<'_> {
          }
- 
+
          let scope_id = self.doc.nodes[node_id]
 -            .parent
 -            .get()
@@ -2111,12 +2579,20 @@ index b7ef9af..131a205 100644
              .filter(|&parent_id| self.doc.nodes[parent_id].is_element())
              .unwrap_or(node_id);
          self.doc.nodes[scope_id].set_restyle_hint(RestyleHint::restyle_subtree());
-@@ -470,15 +472,19 @@ impl DocumentMutator<'_> {
+@@ -394,6 +400,7 @@ impl DocumentMutator<'_> {
+
+     pub fn set_attribute(&mut self, node_id: NodeId, name: QualName, value: &str) {
+         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
++        self.note_base_href_write(node_id, &name, node_is_in_document);
+         if node_is_in_document {
+             self.doc.snapshot_node_for_attr(node_id, Some(&name.local));
+
+@@ -470,15 +477,19 @@ impl DocumentMutator<'_> {
          let NodeData::Element(ref mut element) = node.data else {
              return;
          };
 +        let element: &mut ElementData = element;
- 
+
          self.mutations_occurred |= node_is_in_document;
          // If element is a CustomWidget, then Ccall attribute_changed on it
          #[cfg(feature = "custom-widget")]
@@ -2134,9 +2610,9 @@ index b7ef9af..131a205 100644
 +                    .attribute_changed(&name.local, old_value.as_deref(), Some(value));
 +            }
          }
- 
+
          element.attrs.set(name.clone(), value);
-@@ -606,7 +612,7 @@ impl DocumentMutator<'_> {
+@@ -606,7 +617,7 @@ impl DocumentMutator<'_> {
              self.doc.slot_assignments_dirty = true;
          }
          if *attr == local_name!("slot") {
@@ -2145,8 +2621,28 @@ index b7ef9af..131a205 100644
                  if self.doc.nodes[parent_id].attached_shadow_root_id().is_some() {
                      self.doc.damage_host_subtree(parent_id);
                  }
-@@ -664,7 +670,7 @@ impl DocumentMutator<'_> {
- 
+@@ -621,8 +632,19 @@ impl DocumentMutator<'_> {
+         }
+     }
+
++    /// A connected `<base>`'s href decides the document base URL, so its writes move the epoch.
++    fn note_base_href_write(&mut self, node_id: NodeId, name: &QualName, in_document: bool) {
++        if in_document
++            && name.local == local_name!("href")
++            && self.doc.nodes[node_id].data.is_element_with_tag_name(&local_name!("base"))
++        {
++            self.doc.base_epoch = self.doc.base_epoch.wrapping_add(1);
++        }
++    }
++
+     pub fn clear_attribute(&mut self, node_id: NodeId, name: QualName) {
+         let node_is_in_document = self.doc.nodes[node_id].flags.is_in_document();
++        self.note_base_href_write(node_id, &name, node_is_in_document);
+         if node_is_in_document {
+             self.doc.snapshot_node_for_attr(node_id, Some(&name.local));
+
+@@ -664,7 +686,7 @@ impl DocumentMutator<'_> {
+
          // If element is a CustomWidget, then call attribute_changed on it
          #[cfg(feature = "custom-widget")]
 -        if let SpecialElementData::CustomWidget(widget_data) = &mut element.special_data {
@@ -2154,9 +2650,9 @@ index b7ef9af..131a205 100644
              let old_value = removed_attr.as_ref().map(|attr| &*attr.value);
              widget_data
                  .widget
-@@ -788,7 +794,12 @@ impl DocumentMutator<'_> {
+@@ -788,7 +810,12 @@ impl DocumentMutator<'_> {
          let node = &mut self.doc.nodes[node_id];
- 
+
          // Update child_idx values
 -        if let Some(parent_id) = node.parent.take() {
 +        if let Some(parent_id) = node.take_parent_id() {
@@ -2168,7 +2664,7 @@ index b7ef9af..131a205 100644
              self.mutations_occurred |= node_is_in_document;
              let parent = &mut self.doc.nodes[parent_id];
              parent.insert_damage(ALL_DAMAGE);
-@@ -805,7 +816,7 @@ impl DocumentMutator<'_> {
+@@ -805,7 +832,7 @@ impl DocumentMutator<'_> {
              }
              // Mark ancestors dirty so the style traversal visits this subtree.
              parent.mark_ancestors_dirty();
@@ -2177,43 +2673,43 @@ index b7ef9af..131a205 100644
              self.maybe_record_node(parent_id);
          }
      }
-@@ -834,7 +845,7 @@ impl DocumentMutator<'_> {
+@@ -834,7 +861,7 @@ impl DocumentMutator<'_> {
          self.mutations_occurred |= node_is_in_document;
- 
+
          // Update child_idx values
 -        if let Some(parent_id) = node.as_ref().and_then(|node| node.parent.get()) {
 +        if let Some(parent_id) = node.as_ref().and_then(|node| node.parent_id()) {
              let parent = &mut self.doc.nodes[parent_id];
              parent.insert_damage(ALL_DAMAGE);
              let parent_is_in_doc = parent.flags.is_in_document();
-@@ -851,7 +862,7 @@ impl DocumentMutator<'_> {
+@@ -851,7 +878,7 @@ impl DocumentMutator<'_> {
                  parent.mark_ancestors_dirty();
              }
- 
+
 -            parent.children.retain(|id| *id != node_id);
 +            parent.remove_child(node_id);
              self.maybe_record_node(parent_id);
          }
- 
-@@ -863,7 +874,7 @@ impl DocumentMutator<'_> {
- 
+
+@@ -863,7 +890,7 @@ impl DocumentMutator<'_> {
+
          // Same ordering constraint as remove_node, once per child
          // since each is a separate removal as far as `:has()` is concerned.
 -        for child_id in self.doc.nodes[node_id].children.clone() {
 +        for child_id in self.doc.nodes[node_id].children().to_vec() {
              self.doc.invalidate_relative_selectors_for_removal(child_id);
          }
- 
-@@ -882,7 +893,7 @@ impl DocumentMutator<'_> {
+
+@@ -882,7 +909,7 @@ impl DocumentMutator<'_> {
              parent.mark_ancestors_dirty();
          }
- 
+
 -        let children = mem::take(&mut parent.children);
 +        let children = parent.take_children();
          self.mutations_occurred |= parent_is_in_doc && !children.is_empty();
          for child_id in children {
              self.process_removed_subtree(child_id);
-@@ -904,7 +915,7 @@ impl DocumentMutator<'_> {
+@@ -904,7 +931,7 @@ impl DocumentMutator<'_> {
          on_drop: &mut dyn FnMut(NodeId),
      ) {
          if let Some(node) = self.doc.get_node(node_id) {
@@ -2222,7 +2718,7 @@ index b7ef9af..131a205 100644
                  self.remove_and_drop_node_with(node_id, on_drop);
              }
          }
-@@ -913,17 +924,15 @@ impl DocumentMutator<'_> {
+@@ -913,17 +940,15 @@ impl DocumentMutator<'_> {
      /// Remove all of the children from old_parent_id and append them to new_parent_id
      pub fn append_children(&mut self, parent_id: NodeId, child_ids: &[NodeId]) {
          self.add_children_to_parent(parent_id, child_ids, &|parent, child_ids| {
@@ -2230,7 +2726,7 @@ index b7ef9af..131a205 100644
 +            parent.extend_children(child_ids.iter().copied());
          });
      }
- 
+
      pub fn insert_nodes_before(&mut self, anchor_node_id: NodeId, new_node_ids: &[NodeId]) {
 -        let parent_id = self.doc.nodes[anchor_node_id].parent.get().unwrap();
 +        let parent_id = self.doc.nodes[anchor_node_id].parent_id().unwrap();
@@ -2242,8 +2738,8 @@ index b7ef9af..131a205 100644
 +            parent.insert_children(node_child_idx, child_ids.iter().copied());
          });
      }
- 
-@@ -943,7 +952,7 @@ impl DocumentMutator<'_> {
+
+@@ -943,7 +968,7 @@ impl DocumentMutator<'_> {
          // A reparent is a removal from the old position, so it needs the same
          // pre-unlink invalidation as remove_node.
          for &child_id in child_ids {
@@ -2252,7 +2748,19 @@ index b7ef9af..131a205 100644
                  self.doc.invalidate_relative_selectors_for_removal(child_id);
              }
          }
-@@ -975,10 +984,16 @@ impl DocumentMutator<'_> {
+@@ -966,6 +991,11 @@ impl DocumentMutator<'_> {
+             let child = &mut self.doc.nodes[child_id];
+             let child_was_in_doc = child.flags.is_in_document();
+             self.mutations_occurred |= child_was_in_doc;
++            // A connected move can change which `base[href]` comes first even when the moved
++            // node is not the base itself, so every connected move invalidates the cached URL.
++            if child_was_in_doc {
++                self.doc.base_epoch = self.doc.base_epoch.wrapping_add(1);
++            }
+             if new_parent_is_in_document
+                 && child_was_in_doc
+                 && child.containing_shadow_root_id().is_some() != new_in_shadow
+@@ -975,10 +1005,16 @@ impl DocumentMutator<'_> {
              // Reparenting invalidates any slot assignment; the next
              // resolve's flush_slot_assignments re-establishes it.
              child.set_assigned_slot(None);
@@ -2260,7 +2768,7 @@ index b7ef9af..131a205 100644
 +            let Some(old_parent_id) = child.take_parent_id() else {
                  continue;
              };
- 
+
 +            if self.doc.nodes[child_id].layout_parent_id() == Some(old_parent_id) {
 +                // A slot-index link would outlive the old parent's slot; the next resolve
 +                // re-establishes it under whichever container ends up laying this node out.
@@ -2269,26 +2777,26 @@ index b7ef9af..131a205 100644
 +
              let old_parent = &mut self.doc.nodes[old_parent_id];
              old_parent.insert_damage(ALL_DAMAGE);
- 
-@@ -994,7 +1009,7 @@ impl DocumentMutator<'_> {
+
+@@ -994,7 +1030,7 @@ impl DocumentMutator<'_> {
                  old_parent.mark_ancestors_dirty();
              }
- 
+
 -            old_parent.children.retain(|id| *id != child_id);
 +            old_parent.remove_child(child_id);
              self.maybe_record_node(old_parent_id);
          }
- 
-@@ -1023,7 +1038,7 @@ impl DocumentMutator<'_> {
+
+@@ -1024,7 +1060,7 @@ impl DocumentMutator<'_> {
          for child_id in child_ids.iter().copied() {
              let child = &mut self.doc.nodes[child_id];
              let child_was_in_doc = child.flags.is_in_document();
 -            child.parent.set(Some(parent_id));
 +            child.set_parent_id(Some(parent_id));
- 
+
              if new_parent_is_in_document && !child_was_in_doc {
                  self.process_added_subtree(child_id);
-@@ -1067,29 +1082,29 @@ impl DocumentMutator<'_> {
+@@ -1068,29 +1104,29 @@ impl DocumentMutator<'_> {
          let (Some(&first_id), Some(&last_id)) = (child_ids.first(), child_ids.last()) else {
              return;
          };
@@ -2327,16 +2835,16 @@ index b7ef9af..131a205 100644
          }
          for id in targets {
              self.doc.nodes[id].set_restyle_hint(RestyleHint::restyle_subtree());
-@@ -1108,7 +1123,7 @@ impl DocumentMutator<'_> {
+@@ -1109,7 +1145,7 @@ impl DocumentMutator<'_> {
      }
- 
+
      pub fn reparent_children(&mut self, old_parent_id: NodeId, new_parent_id: NodeId) {
 -        let child_ids = std::mem::take(&mut self.doc.nodes[old_parent_id].children);
 +        let child_ids = self.doc.nodes[old_parent_id].take_children();
          self.maybe_record_node(old_parent_id);
          self.append_children(new_parent_id, &child_ids);
      }
-@@ -1165,11 +1180,11 @@ impl DocumentMutator<'_> {
+@@ -1166,11 +1202,11 @@ impl DocumentMutator<'_> {
          excluded: &[NodeId],
      ) -> Option<NodeId> {
          let node = self.doc.get_node(anchor_id)?;
@@ -2350,7 +2858,7 @@ index b7ef9af..131a205 100644
              if !excluded.contains(&sibling_id) {
                  return Some(sibling_id);
              }
-@@ -1331,7 +1346,7 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -1332,7 +1368,7 @@ impl<'doc> DocumentMutator<'doc> {
          // The embedder may still hold wrappers for replaced children. Detach
          // them here; the DOM shim drops only subtrees it can prove are
          // unwrapped after this operation returns.
@@ -2359,7 +2867,7 @@ index b7ef9af..131a205 100644
          for child_id in old_children {
              self.remove_node(child_id);
          }
-@@ -1405,8 +1420,11 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -1406,8 +1442,11 @@ impl<'doc> DocumentMutator<'doc> {
              if let Some(shadow_root_id) = node.attached_shadow_root_id() {
                  reindex_subtree_ids_inner(doc, shadow_root_id, in_shadow);
              }
@@ -2373,7 +2881,7 @@ index b7ef9af..131a205 100644
                  reindex_subtree_ids_inner(doc, child_id, children_in_shadow);
              }
          }
-@@ -1415,8 +1433,7 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -1416,8 +1455,7 @@ impl<'doc> DocumentMutator<'doc> {
      fn process_added_subtree(&mut self, node_id: NodeId) {
          self.doc.iter_subtree_mut(node_id, |node_id, doc| {
              let in_template_contents = doc.nodes[node_id]
@@ -2383,18 +2891,36 @@ index b7ef9af..131a205 100644
                  .is_some_and(|parent_id| is_template_inert_context(doc, parent_id));
              let in_document = !in_template_contents;
              if in_document {
-@@ -1555,7 +1572,7 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -1461,6 +1499,7 @@ impl<'doc> DocumentMutator<'doc> {
+                 "style" => {
+                     self.style_nodes.insert(node_id);
+                 }
++                "base" => doc.base_epoch = doc.base_epoch.wrapping_add(1),
+                 _ if has_custom_widget => {}
+                 "link" => self.eager_op_queue.push(SpecialOp::LoadStylesheet(node_id)),
+                 "img" => self.eager_op_queue.push(SpecialOp::LoadImage(node_id)),
+@@ -1505,6 +1544,9 @@ impl<'doc> DocumentMutator<'doc> {
+             // ancestor chain, IME disable on blur of a focused input).
+             doc.clear_interaction_state_for_removed_node(node_id);
+
++            if doc.nodes[node_id].data.is_element_with_tag_name(&local_name!("base")) {
++                doc.base_epoch = doc.base_epoch.wrapping_add(1);
++            }
+             let is_style = doc.nodes[node_id]
+                 .data
+                 .is_element_with_tag_name(&local_name!("style"));
+@@ -1556,7 +1598,7 @@ impl<'doc> DocumentMutator<'doc> {
                  return;
              };
- 
+
 -            match &element.special_data {
 +            match element.special_data() {
                  SpecialElementData::SubDocument(_) => {
                      self.eager_op_queue
                          .push(SpecialOp::UnloadSubDocument(node_id));
-@@ -1611,13 +1628,13 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -1612,13 +1654,13 @@ impl<'doc> DocumentMutator<'doc> {
          let node = &self.doc.nodes[target_id];
- 
+
          let mut is_in_head = false;
 -            let mut parent_id = node.parent.get();
 +            let mut parent_id = node.parent_id();
@@ -2406,9 +2932,9 @@ index b7ef9af..131a205 100644
 -            parent_id = parent.parent.get();
 +            parent_id = parent.parent_id();
          }
- 
+
          let rel_attr = node.attr(local_name!("rel"));
-@@ -1647,7 +1664,7 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -1648,7 +1690,7 @@ impl<'doc> DocumentMutator<'doc> {
          let handler = ResourceHandler::new(
              self.doc.tx.clone(),
              self.doc.id(),
@@ -2417,7 +2943,7 @@ index b7ef9af..131a205 100644
              self.doc.shell_provider.clone(),
              StylesheetHandler {
                  source_url: url.clone(),
-@@ -1719,7 +1736,7 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -1720,7 +1762,7 @@ impl<'doc> DocumentMutator<'doc> {
          let Some(element) = node.element_data_mut() else {
              unreachable!();
          };
@@ -2425,8 +2951,8 @@ index b7ef9af..131a205 100644
 +        let SpecialElementData::Stylesheet(stylesheet) = element.take_special_data() else {
              unreachable!();
          };
- 
-@@ -1752,12 +1769,12 @@ impl<'doc> DocumentMutator<'doc> {
+
+@@ -1753,12 +1795,12 @@ impl<'doc> DocumentMutator<'doc> {
      /// re-fire `load_image` when a `<source>`'s srcset changes
      /// post-mount.
      fn find_picture_img_sibling(&self, source_id: NodeId) -> Option<NodeId> {
@@ -2441,9 +2967,9 @@ index b7ef9af..131a205 100644
              if self.doc.nodes[child_id]
                  .data
                  .is_element_with_tag_name(&local_name!("img"))
-@@ -1805,10 +1822,10 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -1806,10 +1848,10 @@ impl<'doc> DocumentMutator<'doc> {
          let node = &self.doc.nodes[target_id];
- 
+
          // Step 1: <picture><source> walk.
 -        if let Some(parent_id) = node.parent.get() {
 +        if let Some(parent_id) = node.parent_id() {
@@ -2454,7 +2980,7 @@ index b7ef9af..131a205 100644
                      if sibling_id == target_id {
                          // <source> elements only count if they
                          // precede the <img> in tree order.
-@@ -1880,8 +1897,7 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -1881,8 +1923,7 @@ impl<'doc> DocumentMutator<'doc> {
              waiting.retain(|(id, ty)| !(*id == target_id && matches!(ty, ImageType::Image)));
          }
          if self.doc.nodes[target_id]
@@ -2464,7 +2990,7 @@ index b7ef9af..131a205 100644
              .is_some_and(|parent_id| is_template_inert_context(self.doc, parent_id))
          {
              return;
-@@ -1907,8 +1923,9 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -1908,8 +1949,9 @@ impl<'doc> DocumentMutator<'doc> {
                      #[cfg(feature = "tracing")]
                      tracing::info!("Loading image {src_string} from cache");
                      let node = &mut self.doc.nodes[target_id];
@@ -2476,7 +3002,7 @@ index b7ef9af..131a205 100644
                      node.clear_layout_cache();
                      node.insert_damage(ALL_DAMAGE);
                      return;
-@@ -2007,7 +2024,7 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -2008,7 +2050,7 @@ impl<'doc> DocumentMutator<'doc> {
                  let canvas_data = SpecialElementData::Canvas(Box::new(CanvasData {
                      custom_paint_source_id,
                  }));
@@ -2485,7 +3011,7 @@ index b7ef9af..131a205 100644
              }
          }
      }
-@@ -2050,7 +2067,7 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -2051,7 +2093,7 @@ impl<'doc> DocumentMutator<'doc> {
          // option / optgroup / script / template only, so any
          // Text child can only be ours (or parser-emitted
          // whitespace, which is invisible either way).
@@ -2494,7 +3020,7 @@ index b7ef9af..131a205 100644
              if self.doc.nodes[id].is_text_node() {
                  Some(id)
              } else {
-@@ -2096,10 +2113,9 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -2097,10 +2139,9 @@ impl<'doc> DocumentMutator<'doc> {
          let mut first_option: Option<NodeId> = None;
          let mut first_enabled_option: Option<NodeId> = None;
          let mut pending = node
@@ -2506,7 +3032,7 @@ index b7ef9af..131a205 100644
              .map(|id| (id, false))
              .collect::<Vec<_>>();
          while let Some((child_id, disabled_by_group)) = pending.pop() {
-@@ -2130,10 +2146,9 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -2131,10 +2172,9 @@ impl<'doc> DocumentMutator<'doc> {
                      disabled_by_group || child_data.attr(local_name!("disabled")).is_some();
                  pending.extend(
                      child_node
@@ -2518,7 +3044,7 @@ index b7ef9af..131a205 100644
                          .map(|id| (id, group_disabled)),
                  );
              }
-@@ -2212,8 +2227,9 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -2213,8 +2253,9 @@ impl<'doc> DocumentMutator<'doc> {
              if !(is_multiline || is_text_input) {
                  return false;
              }
@@ -2530,7 +3056,7 @@ index b7ef9af..131a205 100644
          }
          let Some(input_data) = element.text_input_data_mut() else {
              return false;
-@@ -2338,7 +2354,7 @@ fn set_input_checked_state(element: &mut ElementData, value: String) {
+@@ -2339,7 +2380,7 @@ fn set_input_checked_state(element: &mut ElementData, value: String) {
      let Ok(checked) = value.parse() else {
          return;
      };
@@ -2539,8 +3065,8 @@ index b7ef9af..131a205 100644
          SpecialElementData::CheckboxInput(_) => element.set_checkbox_input_checked(checked),
          // If we have just constructed the element, set the node attribute,
          // and NodeSpecificData will be created from that later
-@@ -2740,7 +2756,7 @@ mod test {
- 
+@@ -2741,7 +2782,7 @@ mod test {
+
      fn make_picture_doc(sources: &[(&str, &str)], img_src: &str) -> (BaseDocument, NodeId) {
          let mut document = BaseDocument::new(DocumentConfig::default());
 -        let root_id = document.root_node().id;
@@ -2548,7 +3074,7 @@ index b7ef9af..131a205 100644
          let img_id = {
              let mut mutator = document.mutate();
              let picture = mutator.create_element(qual_name!("picture"), vec![]);
-@@ -2749,14 +2765,14 @@ mod test {
+@@ -2750,14 +2791,14 @@ mod test {
                  children.push(mutator.create_element(
                      qual_name!("source"),
                      vec![
@@ -2566,15 +3092,15 @@ index b7ef9af..131a205 100644
              );
              children.push(img);
              mutator.append_children(picture, &children);
-@@ -2811,14 +2827,14 @@ mod test {
+@@ -2812,14 +2853,14 @@ mod test {
      }
- 
+
      fn select_label_text(document: &BaseDocument, select_id: NodeId) -> String {
 -        let label_id = *document.nodes[select_id].children.last().unwrap();
 +        let label_id = document.nodes[select_id].children().last().unwrap();
          document.nodes[label_id].text_content()
      }
- 
+
      #[test]
      fn select_label_follows_tree_order_and_default_selectedness() {
          let mut document = BaseDocument::new(DocumentConfig::default());
@@ -2583,7 +3109,7 @@ index b7ef9af..131a205 100644
          let (select_id, selected_group_id, selected_later_id) = {
              let mut mutator = document.mutate();
              let select = mutator.create_element(qual_name!("select"), vec![]);
-@@ -2942,9 +2958,9 @@ mod test {
+@@ -2943,9 +2984,9 @@ mod test {
      #[test]
      fn mutator_remove_disabled() {
          let mut document = BaseDocument::new(DocumentConfig::default());
@@ -2593,9 +3119,51 @@ index b7ef9af..131a205 100644
 -            vec![Attribute::new(qual_name!("disabled"), "".into())],
 +            vec![Attribute::new(qual_name!("disabled"), "")],
          ))));
- 
+
          let node = document.get_node(id).unwrap();
-@@ -2975,7 +2991,7 @@ mod test {
+@@ -2973,10 +3014,49 @@ mod test {
+         );
+     }
+
++    #[test]
++    fn base_epoch_moves_only_for_connected_base_changes() {
++        let mut document = BaseDocument::new(DocumentConfig::default());
++        let base = document.create_node(NodeData::Element(crate::pool::PoolBox::new(
++            ElementData::new(qual_name!("base"), vec![]),
++        )));
++        let div = document.create_node(NodeData::Element(crate::pool::PoolBox::new(
++            ElementData::new(qual_name!("div"), vec![]),
++        )));
++        let root = document.root_node().id();
++        let mut mutator = document.mutate();
++        mutator.set_attribute(base, qual_name!("href"), "/detached/");
++        drop(mutator);
++        assert_eq!(document.base_epoch, 0, "a detached base does not count");
++
++        let mut mutator = document.mutate();
++        mutator.append_children(root, &[base, div]);
++        drop(mutator);
++        let attached = document.base_epoch;
++        assert_ne!(attached, 0, "connecting a base moves the epoch");
++
++        let mut mutator = document.mutate();
++        mutator.set_attribute(div, qual_name!("href"), "/x/");
++        mutator.set_attribute(base, qual_name!("target"), "_top");
++        drop(mutator);
++        assert_eq!(document.base_epoch, attached, "other writes leave it");
++
++        let mut mutator = document.mutate();
++        mutator.set_attribute(base, qual_name!("href"), "/y/");
++        drop(mutator);
++        let rewritten = document.base_epoch;
++        assert_ne!(rewritten, attached, "a base href write moves it");
++
++        let mut mutator = document.mutate();
++        mutator.clear_attribute(base, qual_name!("href"));
++        drop(mutator);
++        assert_ne!(document.base_epoch, rewritten, "removing the href moves it");
++    }
++
      #[test]
      fn mutator_set_disabled() {
          let mut document = BaseDocument::new(DocumentConfig::default());
@@ -2604,7 +3172,7 @@ index b7ef9af..131a205 100644
              qual_name!("button"),
              vec![],
          ))));
-@@ -3009,7 +3025,7 @@ mod test {
+@@ -3010,7 +3090,7 @@ mod test {
      #[test]
      fn mutator_set_disabled_invalid_node() {
          let mut document = BaseDocument::new(DocumentConfig::default());
@@ -2613,13 +3181,13 @@ index b7ef9af..131a205 100644
              qual_name!("a"),
              vec![],
          ))));
-@@ -3042,13 +3058,13 @@ mod test {
+@@ -3043,13 +3123,13 @@ mod test {
      #[test]
      fn mutator_id_attribute_updates_id_map() {
          let mut document = BaseDocument::new(DocumentConfig::default());
 -        let root_id = document.root_node().id;
 +        let root_id = document.root_node().id();
- 
+
          let node_id = {
              let mut mutator = document.mutate();
              let node_id = mutator.create_element(
@@ -2629,25 +3197,25 @@ index b7ef9af..131a205 100644
              );
              mutator.append_children(root_id, &[node_id]);
              node_id
-@@ -3072,7 +3088,7 @@ mod test {
+@@ -3073,7 +3153,7 @@ mod test {
      #[test]
      fn get_element_by_id_duplicate_ids_first_in_tree_order_wins() {
          let mut document = BaseDocument::new(DocumentConfig::default());
 -        let root_id = document.root_node().id;
 +        let root_id = document.root_node().id();
- 
+
          let (first_id, second_id) = {
              let mut mutator = document.mutate();
-@@ -3112,7 +3128,7 @@ mod test {
+@@ -3113,7 +3193,7 @@ mod test {
              shell_provider: Some(shell.clone()),
              ..Default::default()
          });
 -        let root_id = document.root_node().id;
 +        let root_id = document.root_node().id();
- 
+
          {
              let mut mutator = document.mutate();
-@@ -3167,7 +3183,7 @@ mod test {
+@@ -3168,7 +3248,7 @@ mod test {
              shell_provider: Some(shell.clone()),
              ..Default::default()
          });
@@ -2656,16 +3224,16 @@ index b7ef9af..131a205 100644
          let (child_id, grandchild_id, detached_parent_id) = {
              let mut mutator = document.mutate();
              let in_document_parent_id = mutator.create_element(qual_name!("div"), vec![]);
-@@ -3230,7 +3246,7 @@ mod test {
+@@ -3231,7 +3311,7 @@ mod test {
              viewport: Some(Viewport::new(800, 600, 1.0, ColorScheme::Light)),
              ..Default::default()
          });
 -        let root_id = document.root_node().id;
 +        let root_id = document.root_node().id();
- 
+
          let mover_id = {
              let mut mutator = document.mutate();
-@@ -3281,13 +3297,13 @@ mod test {
+@@ -3282,13 +3362,13 @@ mod test {
              ua_stylesheets: vec![UserAgentStylesheet::parse(css)],
              ..Default::default()
          });
@@ -2681,17 +3249,62 @@ index b7ef9af..131a205 100644
              );
              let span = mutator.create_element(qual_name!("span"), vec![]);
              mutator.append_children(outer, &[x, span]);
-@@ -3353,7 +3369,7 @@ mod test {
+@@ -3354,7 +3434,7 @@ mod test {
              viewport: Some(Viewport::new(800, 600, 1.0, ColorScheme::Light)),
              ..Default::default()
          });
 -        let root_id = document.root_node().id;
 +        let root_id = document.root_node().id();
- 
+
          let div_id = {
              let mut mutator = document.mutate();
+diff --git a/src/net.rs b/src/net.rs
+index e07f073..8a17c65 100644
+--- a/src/net.rs
++++ b/src/net.rs
+@@ -573,18 +573,32 @@ pub fn clear_unloaded_face(
+     });
+ }
+
+-/// True when `family_lc` still has an undelivered face that would serve
+-/// `want`, so matching must not substitute a loaded sibling of another
++/// True when `family` (any case) still has an undelivered face that would
++/// serve `want`, so matching must not substitute a loaded sibling of another
+ /// style. A face with no `font-style` descriptor blocks any request: its
+ /// style is whatever its own metadata says, which needs the bytes.
+-pub fn face_pending_for_style(
+-    family_lc: &str,
+-    want: parley::fontique::FontStyle,
+-) -> bool {
++pub fn face_pending_for_style(family: &str, want: parley::fontique::FontStyle) -> bool {
+     UNLOADED_FACES.with(|c| {
+-        c.borrow()
++        let faces = c.borrow();
++        // Every text span asks, so an ASCII name (lowercased bytewise) is compared in place.
++        if faces.is_empty() {
++            return false;
++        }
++        let family_lc = if family.is_ascii() {
++            None
++        } else {
++            Some(family.to_lowercase())
++        };
++        let is_family = |f: &str| match &family_lc {
++            Some(lc) => f == lc,
++            None => {
++                f.len() == family.len()
++                    && f.bytes().zip(family.bytes()).all(|(a, b)| a == b.to_ascii_lowercase())
++            }
++        };
++        faces
+             .iter()
+-            .any(|(f, s)| f == family_lc && s.is_none_or(|s| s == want))
++            .any(|(f, s)| is_family(f) && s.is_none_or(|s| s == want))
+     })
+ }
+
 diff --git a/src/node/attributes.rs b/src/node/attributes.rs
-index 30ba948..a8371ba 100644
+index 30ba948..55e816e 100644
 --- a/src/node/attributes.rs
 +++ b/src/node/attributes.rs
 @@ -18,8 +18,9 @@ pub struct AttrName {
@@ -2708,7 +3321,7 @@ index 30ba948..a8371ba 100644
  }
 @@ -27,12 +28,12 @@ pub struct Attribute {
  static NS_EMPTY: Namespace = ns!();
- 
+
  impl Attribute {
 -    pub fn new(name: QualName, value: String) -> Self {
 +    pub fn new(name: QualName, value: impl Into<compact_str::CompactString>) -> Self {
@@ -2721,7 +3334,32 @@ index 30ba948..a8371ba 100644
              ext,
          }
      }
-@@ -95,10 +96,9 @@ impl Attributes {
+@@ -87,6 +88,24 @@ impl Attributes {
+             inner: inner.into_iter().collect(),
+         }
+     }
++}
++
++impl From<Vec<Attribute>> for Attributes {
++    fn from(inner: Vec<Attribute>) -> Self {
++        Self::new(inner)
++    }
++}
++
++/// Collects straight into the list, without a `Vec` to copy from first.
++impl FromIterator<Attribute> for Attributes {
++    fn from_iter<I: IntoIterator<Item = Attribute>>(iter: I) -> Self {
++        Self {
++            inner: iter.into_iter().collect(),
++        }
++    }
++}
++
++impl Attributes {
+
+     pub fn get(&mut self, name: &QualName) -> Option<&Attribute> {
+         self.inner.iter().find(|attr| attr.has_name(name))
+@@ -95,10 +114,9 @@ impl Attributes {
      pub fn set(&mut self, name: QualName, value: &str) {
          let existing_attr = self.inner.iter_mut().find(|a| a.has_name(&name));
          if let Some(existing_attr) = existing_attr {
@@ -2733,11 +3371,11 @@ index 30ba948..a8371ba 100644
 +            self.push(Attribute::new(name, value));
          }
      }
- 
-@@ -125,6 +125,20 @@ mod tests {
+
+@@ -125,6 +143,20 @@ mod tests {
      use super::{Attribute, Attributes};
      use markup5ever::{QualName, local_name, ns};
- 
+
 +    #[test]
 +    fn short_values_stay_inline_across_rewrites() {
 +        let name = QualName::new(None, ns!(), local_name!("class"));
@@ -2963,7 +3601,7 @@ index 0000000..9801d0a
 +    }
 +}
 diff --git a/src/node/element.rs b/src/node/element.rs
-index 0c5b2e9..1458d5c 100644
+index 0c5b2e9..868c628 100644
 --- a/src/node/element.rs
 +++ b/src/node/element.rs
 @@ -3,15 +3,16 @@ use kurbo::{Affine, Rect as KurboRect};
@@ -2988,7 +3626,7 @@ index 0c5b2e9..1458d5c 100644
 @@ -24,7 +25,7 @@ use taffy::{Cache, prelude::Layout};
  use thin_vec::ThinVec;
  use url::Url;
- 
+
 -use super::stylo_data::StyloData;
 +use super::stylo_data::{NodeStateFlags, StyloCell, StyloData, StyloDataMut};
  #[cfg(feature = "svg")]
@@ -2997,7 +3635,7 @@ index 0c5b2e9..1458d5c 100644
 @@ -42,11 +43,17 @@ macro_rules! local_names {
      };
  }
- 
+
 +unsafe impl crate::pool::Pooled for ElementData {
 +    fn pool() -> &'static std::sync::Mutex<crate::pool::Pool> {
 +        static POOL: std::sync::Mutex<crate::pool::Pool> =
@@ -3011,13 +3649,13 @@ index 0c5b2e9..1458d5c 100644
      pub name: ElementName,
 -    /// The name's namespace kind and whether the element is focussable or has a snapshot.
 -    bits: ElementBits,
- 
+
      /// The elements id attribute parsed as an atom (if it has one)
      pub id: Option<Atom>,
 @@ -59,14 +66,7 @@ pub struct ElementData {
      /// The element's attributes
      pub attrs: Attributes,
- 
+
 -    /// Heterogeneous data that depends on the element's type.
 -    /// For example:
 -    ///   - The image data for \<img\> elements.
@@ -3059,7 +3697,7 @@ index 0c5b2e9..1458d5c 100644
 +    /// Allocated by the first layout write or derived child list.
 +    pub layout_data: OnceCell<crate::pool::PoolBox<LayoutData>>,
  }
- 
+
 +// Pooled per element: 56 bytes on wasm32 release, where the stylo wrapper is 16.
 +#[cfg(target_pointer_width = "32")]
 +const _: () = assert!(
@@ -3193,7 +3831,7 @@ index 0c5b2e9..1458d5c 100644
 +    /// Derived layout and paint children; read through `Node::layout_children`.
 +    pub(crate) child_lists: super::node::LayoutChildLists,
  }
- 
+
  impl LayoutData {
      pub const fn new() -> Self {
          Self {
@@ -3209,7 +3847,7 @@ index 0c5b2e9..1458d5c 100644
              #[cfg(feature = "writing-mode")]
 @@ -150,6 +257,54 @@ static NO_OFFSETS: BoxOffsets = BoxOffsets {
  };
- 
+
  impl LayoutData {
 +    /// Taffy's unrounded layout of this box.
 +    #[inline]
@@ -3263,7 +3901,7 @@ index 0c5b2e9..1458d5c 100644
          self.offsets.as_deref().unwrap_or(&NO_OFFSETS)
      }
 @@ -179,7 +334,13 @@ impl LayoutData {
- 
+
  /// Shared read-only default returned by accessors for nodes whose
  /// [`LayoutData`] has never been allocated.
 -pub(crate) static DEFAULT_LAYOUT_DATA: LayoutData = LayoutData::new();
@@ -3274,23 +3912,23 @@ index 0c5b2e9..1458d5c 100644
 +// SAFETY: the shared default is only ever read. Its one interior-mutable part, the child
 +// lists, is reached only through `Node::child_lists`, which never yields the default.
 +unsafe impl Sync for SharedLayoutData {}
- 
+
  type ImageLayers = ThinVec<Option<ImageResourceData>>;
- 
+
 @@ -213,7 +374,8 @@ enum NameNs {
      Other,
  }
- 
+
 -/// An element's [`NameNs`] and its plain boolean flags, packed into one byte.
 +/// An element's [`NameNs`] and its plain boolean flags, packed into five bits of its
 +/// [`NodeStateFlags`] word.
  #[derive(Clone, Copy)]
  struct ElementBits(u8);
- 
+
 @@ -252,7 +414,178 @@ impl ElementBits {
      }
  }
- 
+
 -const _: () = assert!(ElementSelectorFlags::all().bits() <= u16::MAX as usize);
 +const _: () = assert!(NameNs::Other as u8 <= ElementBits::NS);
 +const _: () = assert!(
@@ -3464,13 +4102,13 @@ index 0c5b2e9..1458d5c 100644
 +    }
 +    assert!(union.count_ones() == ones);
 +};
- 
+
  /// [`ElementState`] stored in 32 bits. Blitz sets only states in bits 0 to 31 (focus ring is
  /// bit 30); storing a higher one panics rather than dropping it.
 @@ -298,19 +631,21 @@ impl ElementStateBits {
      }
  }
- 
+
 -/// A cell of [`ElementSelectorFlags`] stored in 16 bits, which hold every defined flag.
 -#[derive(Debug, Default)]
 -pub struct SelectorFlagsCell(Cell<u16>);
@@ -3478,7 +4116,7 @@ index 0c5b2e9..1458d5c 100644
 +/// state word, which hold every defined flag.
 +#[derive(Clone, Copy)]
 +pub struct SelectorFlagsRef<'a>(&'a NodeStateFlags);
- 
+
 -impl SelectorFlagsCell {
 +impl SelectorFlagsRef<'_> {
      #[inline]
@@ -3487,7 +4125,7 @@ index 0c5b2e9..1458d5c 100644
 +    pub fn get(self) -> ElementSelectorFlags {
 +        self.0.selector_flags()
      }
- 
+
 +    /// Replaces the stored flags.
      #[inline]
 -    pub fn set(&self, flags: ElementSelectorFlags) {
@@ -3496,7 +4134,7 @@ index 0c5b2e9..1458d5c 100644
 +        self.0.set_selector_flags(flags);
      }
  }
- 
+
 @@ -345,8 +680,20 @@ struct ElementRare {
      list_item_data: Option<Box<ListItemLayout>>,
      /// The resolved 2D transform in device pixels, when the element has one.
@@ -3505,7 +4143,7 @@ index 0c5b2e9..1458d5c 100644
 +    /// \<img\> or the text editor for input/textarea elements.
 +    special_data: SpecialElementData,
  }
- 
+
 +/// Shared read-only `None` returned by [`ElementData::special_data`] without a rare box.
 +static NO_SPECIAL_DATA: SharedSpecialData = SharedSpecialData(SpecialElementData::None);
 +
@@ -3525,7 +4163,7 @@ index 0c5b2e9..1458d5c 100644
 +            && matches!(self.special_data, SpecialElementData::None)
      }
  }
- 
+
 @@ -367,23 +715,47 @@ impl ElementData {
      /// Whether the element is focussable.
      #[inline]
@@ -3533,13 +4171,13 @@ index 0c5b2e9..1458d5c 100644
 -        self.bits.get(ElementBits::FOCUSSABLE)
 +        self.state_flags.element_bits().get(ElementBits::FOCUSSABLE)
      }
- 
+
      #[inline]
      pub fn has_snapshot(&self) -> bool {
 -        self.bits.get(ElementBits::HAS_SNAPSHOT)
 +        self.state_flags.element_bits().get(ElementBits::HAS_SNAPSHOT)
      }
- 
+
      #[inline]
      pub fn set_has_snapshot(&mut self, value: bool) {
 -        self.bits.set(ElementBits::HAS_SNAPSHOT, value);
@@ -3569,7 +4207,7 @@ index 0c5b2e9..1458d5c 100644
 +    pub fn set_display_constructed_as(&mut self, display: StyloDisplay) {
 +        self.state_flags.set_display(display);
      }
- 
+
      /// The namespace of the element's name.
      #[inline]
      pub fn namespace(&self) -> &Namespace {
@@ -3590,7 +4228,7 @@ index 0c5b2e9..1458d5c 100644
 @@ -564,6 +936,35 @@ impl ElementData {
          self.update_rare(|rare| store_transform(&mut rare.transform, transform));
      }
- 
+
 +    /// Heterogeneous data that depends on the element's type. For example the image data for
 +    /// \<img\> elements or the text editor for input/textarea elements.
 +    #[inline]
@@ -3630,7 +4268,7 @@ index 0c5b2e9..1458d5c 100644
 -        self.layout_data.as_deref().unwrap_or(&DEFAULT_LAYOUT_DATA)
 +        self.layout_data.get().map_or(&DEFAULT_LAYOUT_DATA.0, |data| data)
      }
- 
+
      /// Mutable access to this element's layout output state, allocating it if
      /// it does not yet exist.
      #[inline]
@@ -3638,24 +4276,24 @@ index 0c5b2e9..1458d5c 100644
 -        self.layout_data.get_or_insert_default()
 +        layout_data_mut(&mut self.layout_data)
      }
- 
+
      /// Parley text layout (elements with inline inner display mode only).
      #[inline]
      pub fn inline_layout_data(&self) -> Option<&TextLayout> {
 -        self.layout_data.as_deref()?.inline_layout.as_deref()
 +        self.layout_data.get()?.inline_layout.as_deref()
      }
- 
+
      #[inline]
      pub fn inline_layout_data_mut(&mut self) -> Option<&mut TextLayout> {
 -        self.layout_data.as_deref_mut()?.inline_layout.as_deref_mut()
 +        self.layout_data.get_mut()?.inline_layout.as_deref_mut()
      }
- 
+
      /// Sets the text layout; clearing it never allocates the layout box.
 @@ -619,8 +1020,16 @@ impl ElementData {
      }
- 
+
      pub fn take_inline_layout_data(&mut self) -> Option<Box<TextLayout>> {
 -        self.layout_data.as_deref_mut()?.inline_layout.take()
 +        self.layout_data.get_mut()?.inline_layout.take()
@@ -3669,7 +4307,7 @@ index 0c5b2e9..1458d5c 100644
      }
 +    cell.get_mut().expect("layout data was just allocated")
  }
- 
+
  impl DocumentData {
 @@ -628,14 +1037,14 @@ impl DocumentData {
      /// has never written to it.
@@ -3678,7 +4316,7 @@ index 0c5b2e9..1458d5c 100644
 -        self.layout_data.as_deref().unwrap_or(&DEFAULT_LAYOUT_DATA)
 +        self.layout_data.get().map_or(&DEFAULT_LAYOUT_DATA.0, |data| data)
      }
- 
+
      /// Mutable access to the document node's layout output state, allocating
      /// it if it does not yet exist.
      #[inline]
@@ -3687,7 +4325,7 @@ index 0c5b2e9..1458d5c 100644
 +        layout_data_mut(&mut self.layout_data)
      }
  }
- 
+
 @@ -645,20 +1054,15 @@ impl DocumentData {
  /// carries the same style/layout fields that were previously stored directly on
  /// [`Node`](super::Node).
@@ -3714,7 +4352,7 @@ index 0c5b2e9..1458d5c 100644
 +    pub layout_data: OnceCell<crate::pool::PoolBox<LayoutData>>,
      pub transform: Option<Box<Affine>>,
  }
- 
+
 @@ -667,13 +1071,13 @@ pub struct DocumentData {
  impl std::fmt::Debug for DocumentData {
      fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -3780,7 +4418,7 @@ index 0c5b2e9..1458d5c 100644
 +        StyloDataMut::new(&mut self.stylo_element_data, &self.state_flags)
 +    }
  }
- 
+
  impl Default for DocumentData {
 @@ -720,14 +1145,14 @@ impl std::fmt::Debug for ElementData {
              .field("attrs", &self.attrs)
@@ -3828,7 +4466,7 @@ index 0c5b2e9..1458d5c 100644
                  };
                  (!clone.is_empty()).then(|| Box::new(clone))
              }),
- 
+
              // Runtime state: reset to defaults.
 -            child_lists: Default::default(),
              stylo_element_data: Default::default(),
@@ -3844,7 +4482,17 @@ index 0c5b2e9..1458d5c 100644
          }
      }
  }
-@@ -884,23 +1301,16 @@ impl ElementData {
+@@ -861,7 +1278,8 @@ pub fn parse_class_list(value: &str) -> ThinVec<Atom> {
+ }
+
+ impl ElementData {
+-    pub fn new(name: QualName, attrs: Vec<Attribute>) -> Self {
++    pub fn new(name: QualName, attrs: impl Into<Attributes>) -> Self {
++        let attrs: Attributes = attrs.into();
+         let id_attr_atom = attrs
+             .iter()
+             .find(|attr| &attr.name.local == "id")
+@@ -884,23 +1302,16 @@ impl ElementData {
              None => NameNs::Other,
          };
          let mut data = ElementData {
@@ -3853,10 +4501,11 @@ index 0c5b2e9..1458d5c 100644
 -            bits: ElementBits::new(name_ns),
              id: id_attr_atom,
              classes: class_atoms,
-             attrs: Attributes::new(attrs),
+-            attrs: Attributes::new(attrs),
 -            special_data: SpecialElementData::None,
++            attrs,
              rare: None,
- 
+
              stylo_element_data: Default::default(),
 -            selector_flags: SelectorFlagsCell::default(),
              element_state: ElementStateBits::default(),
@@ -3870,10 +4519,10 @@ index 0c5b2e9..1458d5c 100644
          };
          if name_ns == NameNs::Other {
              data.update_rare(|rare| rare.name_ext = Some(Box::new((prefix, ns))));
-@@ -932,6 +1342,16 @@ impl ElementData {
+@@ -932,6 +1343,16 @@ impl ElementData {
          data
      }
- 
+
 +    #[inline]
 +    pub(crate) fn stylo_data(&self) -> StyloData<'_> {
 +        StyloData::new(&self.stylo_element_data, &self.state_flags)
@@ -3887,9 +4536,9 @@ index 0c5b2e9..1458d5c 100644
      pub fn attrs(&self) -> &[Attribute] {
          &self.attrs
      }
-@@ -977,15 +1397,15 @@ impl ElementData {
+@@ -977,15 +1398,15 @@ impl ElementData {
      }
- 
+
      pub fn image_data(&self) -> Option<&ImageData> {
 -        match &self.special_data {
 +        match self.special_data() {
@@ -3897,7 +4546,7 @@ index 0c5b2e9..1458d5c 100644
              _ => None,
          }
      }
- 
+
      pub fn image_data_mut(&mut self) -> Option<&mut ImageData> {
 -        match self.special_data {
 -            SpecialElementData::Image(ref mut data) => Some(&mut **data),
@@ -3906,9 +4555,9 @@ index 0c5b2e9..1458d5c 100644
              _ => None,
          }
      }
-@@ -1005,22 +1425,22 @@ impl ElementData {
+@@ -1005,22 +1426,22 @@ impl ElementData {
      }
- 
+
      pub fn canvas_data(&self) -> Option<&CanvasData> {
 -        match &self.special_data {
 +        match self.special_data() {
@@ -3916,7 +4565,7 @@ index 0c5b2e9..1458d5c 100644
              _ => None,
          }
      }
- 
+
      pub fn sub_doc_data(&self) -> Option<&dyn Document> {
 -        match &self.special_data {
 +        match self.special_data() {
@@ -3924,7 +4573,7 @@ index 0c5b2e9..1458d5c 100644
              _ => None,
          }
      }
- 
+
      pub fn sub_doc_data_mut(&mut self) -> Option<&mut dyn Document> {
 -        match &mut self.special_data {
 -            SpecialElementData::SubDocument(data) => Some(data.as_mut().as_mut()),
@@ -3933,9 +4582,9 @@ index 0c5b2e9..1458d5c 100644
              _ => None,
          }
      }
-@@ -1044,22 +1464,22 @@ impl ElementData {
+@@ -1044,22 +1465,22 @@ impl ElementData {
      }
- 
+
      pub fn text_input_data(&self) -> Option<&TextInputData> {
 -        match &self.special_data {
 +        match self.special_data() {
@@ -3943,7 +4592,7 @@ index 0c5b2e9..1458d5c 100644
              _ => None,
          }
      }
- 
+
      pub fn text_input_data_mut(&mut self) -> Option<&mut TextInputData> {
 -        match &mut self.special_data {
 -            SpecialElementData::TextInput(data) => Some(data),
@@ -3952,7 +4601,7 @@ index 0c5b2e9..1458d5c 100644
              _ => None,
          }
      }
- 
+
      #[cfg(feature = "custom-widget")]
      pub fn custom_widget_data(&self) -> Option<&CustomWidgetData> {
 -        match &self.special_data {
@@ -3960,8 +4609,8 @@ index 0c5b2e9..1458d5c 100644
              SpecialElementData::CustomWidget(data) => Some(data),
              _ => None,
          }
-@@ -1067,14 +1487,14 @@ impl ElementData {
- 
+@@ -1067,14 +1488,14 @@ impl ElementData {
+
      #[cfg(feature = "custom-widget")]
      pub fn custom_widget_data_mut(&mut self) -> Option<&mut CustomWidgetData> {
 -        match &mut self.special_data {
@@ -3971,14 +4620,14 @@ index 0c5b2e9..1458d5c 100644
              _ => None,
          }
      }
- 
+
      pub fn checkbox_input_checked(&self) -> Option<bool> {
 -        match self.special_data {
 +        match *self.special_data() {
              SpecialElementData::CheckboxInput(checked) => Some(checked),
              _ => None,
          }
-@@ -1083,15 +1503,15 @@ impl ElementData {
+@@ -1083,15 +1504,15 @@ impl ElementData {
      /// Live value of an `<input type=range>`, when the
      /// special data has been initialized (layout construct pass).
      pub fn range_input_value(&self) -> Option<f64> {
@@ -3989,7 +4638,7 @@ index 0c5b2e9..1458d5c 100644
              _ => None,
          }
      }
- 
+
      pub fn checkbox_input_checked_mut(&mut self) -> Option<&mut bool> {
 -        match self.special_data {
 -            SpecialElementData::CheckboxInput(ref mut checked) => Some(checked),
@@ -3998,8 +4647,8 @@ index 0c5b2e9..1458d5c 100644
              _ => None,
          }
      }
-@@ -1108,7 +1528,7 @@ impl ElementData {
- 
+@@ -1108,7 +1529,7 @@ impl ElementData {
+
      #[cfg(feature = "file-input")]
      pub fn file_data(&self) -> Option<&FileData> {
 -        match &self.special_data {
@@ -4007,8 +4656,8 @@ index 0c5b2e9..1458d5c 100644
              SpecialElementData::FileInput(data) => Some(data),
              _ => None,
          }
-@@ -1116,8 +1536,8 @@ impl ElementData {
- 
+@@ -1116,8 +1537,8 @@ impl ElementData {
+
      #[cfg(feature = "file-input")]
      pub fn file_data_mut(&mut self) -> Option<&mut FileData> {
 -        match &mut self.special_data {
@@ -4018,37 +4667,37 @@ index 0c5b2e9..1458d5c 100644
              _ => None,
          }
      }
-@@ -1154,7 +1574,7 @@ impl ElementData {
+@@ -1154,7 +1575,7 @@ impl ElementData {
                          }
                      }
                  });
 -        self.bits.set(ElementBits::FOCUSSABLE, is_focussable);
 +        self.set_element_bit(ElementBits::FOCUSSABLE, is_focussable);
      }
- 
+
      pub fn flush_style_attribute(&mut self, guard: &SharedRwLock, url_extra_data: &UrlExtraData) {
-@@ -1276,17 +1696,17 @@ impl ElementData {
+@@ -1276,17 +1697,17 @@ impl ElementData {
      }
- 
+
      pub fn set_sub_document(&mut self, sub_document: Box<dyn Document>) {
 -        self.special_data = SpecialElementData::SubDocument(Box::new(sub_document));
 +        self.set_special_data(SpecialElementData::SubDocument(Box::new(sub_document)));
      }
- 
+
      pub fn remove_sub_document(&mut self) {
 -        self.special_data = SpecialElementData::None;
 +        self.set_special_data(SpecialElementData::None);
      }
- 
+
      #[cfg(feature = "custom-widget")]
      pub fn set_custom_widget(&mut self, widget: Box<dyn crate::Widget>) {
          use crate::node::custom_widget::CustomWidgetData;
 -        self.special_data = SpecialElementData::CustomWidget(CustomWidgetData::new(widget));
 +        self.set_special_data(SpecialElementData::CustomWidget(CustomWidgetData::new(widget)));
      }
- 
+
      #[cfg(feature = "custom-widget")]
-@@ -1295,7 +1715,7 @@ impl ElementData {
+@@ -1295,7 +1716,7 @@ impl ElementData {
              .custom_widget_data_mut()
              .map(|widget_data| widget_data.take_resource_ids())
              .unwrap_or_default();
@@ -4056,11 +4705,11 @@ index 0c5b2e9..1458d5c 100644
 +        self.set_special_data(SpecialElementData::None);
          resource_ids
      }
- 
-@@ -1654,6 +2074,38 @@ mod rare_tests {
+
+@@ -1654,6 +2075,38 @@ mod rare_tests {
      use blitz_traits::node_id::NodeId;
      use markup5ever::{QualName, local_name, ns};
- 
+
 +    #[test]
 +    fn layouts_round_trip_with_edges_kept_only_while_non_zero() {
 +        use taffy::{Layout, Point, Rect, Size};
@@ -4096,10 +4745,10 @@ index 0c5b2e9..1458d5c 100644
      #[test]
      fn rare_links_round_trip_and_clone_drops_the_shadow_root() {
          let name = QualName::new(None, ns!(html), local_name!("template"));
-@@ -1672,6 +2124,23 @@ mod rare_tests {
+@@ -1672,6 +2125,23 @@ mod rare_tests {
          assert!(el.rare.is_none());
      }
- 
+
 +    #[test]
 +    fn special_data_lives_in_rare_and_survives_clone() {
 +        use super::SpecialElementData;
@@ -4120,7 +4769,7 @@ index 0c5b2e9..1458d5c 100644
      #[test]
      fn element_names_round_trip() {
          let names = [
-@@ -1705,7 +2174,7 @@ mod rare_tests {
+@@ -1705,7 +2175,7 @@ mod rare_tests {
          let href = || {
              vec![super::Attribute::new(
                  QualName::new(None, ns!(), local_name!("href")),
@@ -4129,7 +4778,7 @@ index 0c5b2e9..1458d5c 100644
              )]
          };
          let html = QualName::new(None, ns!(html), local_name!("a"));
-@@ -1732,8 +2201,8 @@ mod rare_tests {
+@@ -1732,8 +2202,8 @@ mod rare_tests {
              ElementState::FOCUSRING | ElementState::UNVISITED | ElementState::HOVER
          );
          let flags = ElementSelectorFlags::all();
@@ -4138,9 +4787,9 @@ index 0c5b2e9..1458d5c 100644
 +        el.selector_flags().set(flags);
 +        assert_eq!(el.selector_flags().get().bits(), flags.bits());
      }
- 
+
      #[test]
-@@ -1775,4 +2244,154 @@ mod rare_tests {
+@@ -1775,4 +2245,154 @@ mod rare_tests {
          assert!(el.rare.is_none());
          assert!(el.grid_info().is_none());
      }
@@ -4296,12 +4945,12 @@ index 0c5b2e9..1458d5c 100644
 +    }
  }
 diff --git a/src/node/mod.rs b/src/node/mod.rs
-index 5e81524..07ccf19 100644
+index 5e81524..7d5cf0d 100644
 --- a/src/node/mod.rs
 +++ b/src/node/mod.rs
 @@ -1,6 +1,7 @@
  #![allow(clippy::module_inception)]
- 
+
  mod attributes;
 +mod child_list;
  #[cfg(feature = "custom-widget")]
@@ -4316,6 +4965,15 @@ index 5e81524..07ccf19 100644
      SpecialElementData, SpecialElementType, Status, parse_class_list,
  };
  pub use node::*;
+@@ -32,6 +33,7 @@ pub use text::{
+     inline_layout_rebuild_count, inline_summary_stats,
+ };
+ pub(crate) use text::{
+-    EvictedBreak, EvictedLayout, EvictedSummary, InlineRebuild, SummaryCell, count_inline_summary,
++    AlignInputs, EvictedBreak, EvictedLayout, EvictedSummary, InlineRebuild, OutOfFlow, StaticX,
++    SummaryCell, count_inline_summary,
+     with_rebuild_contexts,
+ };
 diff --git a/src/node/node.rs b/src/node/node.rs
 index 2f3cda0..0bcc75b 100644
 --- a/src/node/node.rs
@@ -4337,18 +4995,18 @@ index 2f3cda0..0bcc75b 100644
 @@ -38,8 +38,8 @@ use style_traits::values::ToCss;
  use taffy::{Cache, prelude::Layout};
  use thin_vec::ThinVec;
- 
+
 -use super::stylo_data::{ComputedStyleRef, StyloData};
 -use super::{Attribute, DocumentData, ElementData, ElementStateBits, LayoutData, SelectorFlagsCell};
 +use super::stylo_data::{ComputedStyleRef, NodeStateFlags, StyloData, StyloDataMut};
 +use super::{Attribute, DocumentData, ElementData, ElementStateBits, LayoutData, SelectorFlagsRef};
- 
+
  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
  pub enum DisplayOuter {
 @@ -48,19 +48,33 @@ pub enum DisplayOuter {
      None,
  }
- 
+
 +/// Low bits of a node's `NodeFlags` word that hold its own slot index. Wasm32 memory fits at
 +/// most 2^32 / 36 B ≈ 119M node slots, under 2^27, so any page's index fits beside the flags.
 +pub(crate) const SLOT_INDEX_BITS: u32 = 27;
@@ -4370,7 +5028,7 @@ index 2f3cda0..0bcc75b 100644
 +        const IS_IN_DOCUMENT = 1 << 31;
      }
  }
- 
+
 +const _: () = assert!(NodeFlags::all().bits() & SLOT_INDEX_MASK == 0);
 +
  impl NodeFlags {
@@ -4385,7 +5043,7 @@ index 2f3cda0..0bcc75b 100644
 @@ -83,8 +97,8 @@ impl NodeFlags {
      }
  }
- 
+
 -/// A nullable full-generation node ID. Slotmap's all-ones null key is never
 -/// issued for a live node.
 +/// A nullable full-generation node ID. The all-ones null key is never issued
@@ -4396,7 +5054,7 @@ index 2f3cda0..0bcc75b 100644
 @@ -170,10 +184,227 @@ impl NodeIdCell {
      }
  }
- 
+
 +/// A node's tree links in one word. The low `SLOT_INDEX_BITS` hold the parent's slot index, 0
 +/// (the tree's never-live sentinel slot) for none. Bits 27-28 say whether the layout parent is
 +/// none, the parent itself (nine in ten nodes), or another node in the tree's side table.
@@ -4597,7 +5255,7 @@ index 2f3cda0..0bcc75b 100644
  #[cfg(test)]
  mod compact_node_tests {
      use super::*;
- 
+
 +    #[test]
 +    fn flag_writes_keep_the_slot_index_packed_beside_them() {
 +        let mut flags = NodeFlags::from_bits_retain(SLOT_INDEX_MASK);
@@ -4643,7 +5301,7 @@ index 2f3cda0..0bcc75b 100644
 @@ -234,6 +468,103 @@ mod compact_node_tests {
          assert_eq!(warm, []);
      }
- 
+
 +    #[test]
 +    fn slot_links_resolve_to_the_current_version_of_a_reused_slot() {
 +        let mut doc = crate::BaseDocument::new(Default::default());
@@ -4756,7 +5414,7 @@ index 2f3cda0..0bcc75b 100644
 @@ -373,12 +704,23 @@ struct NodeRare {
      anonymous_blocks: ThinVec<NodeId>,
  }
- 
+
 -#[derive(Default)]
 +/// A box's derived layout and paint children. Kept in its `LayoutData`: the boxes that have
 +/// lists are the ones layout writes to, a quarter of a document's elements.
@@ -4765,7 +5423,7 @@ index 2f3cda0..0bcc75b 100644
      layout: RefCell<Option<ThinVec<NodeId>>>,
      paint: RefCell<Option<ThinVec<NodeId>>>,
  }
- 
+
 +impl LayoutChildLists {
 +    pub(crate) const fn new() -> Self {
 +        Self {
@@ -4777,11 +5435,11 @@ index 2f3cda0..0bcc75b 100644
 +
  /// Parents tracked at once by `child_index`; a tree walk keeps one slot per open ancestor.
  const CHILD_INDEX_HINTS: usize = 64;
- 
+
 @@ -392,19 +734,16 @@ pub struct Node {
      // The actual tree we belong to. This is unsafe!!
      tree: *mut crate::NodeTree,
- 
+
 -    /// Our Id
 -    pub id: NodeId,
 -    /// Our parent's ID
@@ -4793,20 +5451,20 @@ index 2f3cda0..0bcc75b 100644
 +    links: Cell<u32>,
 +    /// Our children's slot indexes, a lone child inline; read through `children`.
 +    children: super::child_list::ChildList,
- 
+
 -    /// Our parent in the layout hierachy: a separate list that includes anonymous collections of inline elements
 -    pub layout_parent: NodeIdCell,
      /// Sparse shadow, out-of-flow, and paint bookkeeping.
      rare: OnceCell<Box<NodeRare>>,
- 
+
 -    // Flags
 +    /// Flags, packed above our own slot index (the version comes from the tree, see `id`).
      pub flags: NodeFlags,
- 
+
      /// Node type (Element, TextNode, etc) specific data.
 @@ -450,27 +789,74 @@ macro_rules! universal_accessors {
  }
- 
+
  universal_accessors! {
 -    stylo_element_data / stylo_element_data_mut: StyloData,
 -    display_constructed_as / display_constructed_as_mut: StyloDisplay,
@@ -4820,7 +5478,7 @@ index 2f3cda0..0bcc75b 100644
 -    // document has to be able to hold selector flags too.
 -    selector_flags / selector_flags_mut: SelectorFlagsCell,
  }
- 
+
  impl Node {
 -    fn child_lists(&self) -> Option<&LayoutChildLists> {
 +    /// The display this box was last constructed with. Panics on non-box node kinds.
@@ -4869,7 +5527,7 @@ index 2f3cda0..0bcc75b 100644
              _ => None,
          }
      }
- 
+
 +    fn child_lists(&self) -> Option<&LayoutChildLists> {
 +        Some(&self.layout_data_cell()?.get()?.child_lists)
 +    }
@@ -4892,7 +5550,7 @@ index 2f3cda0..0bcc75b 100644
          Ref::filter_map(self.child_lists()?.layout.borrow(), |children| children.as_ref()).ok()
 @@ -489,18 +875,14 @@ impl Node {
      }
- 
+
      pub fn set_layout_children(&self, children: Option<ThinVec<NodeId>>) {
 -        if let Some(lists) = self.child_lists() {
 +        if let Some(lists) = self.child_lists_for(&children) {
@@ -4901,7 +5559,7 @@ index 2f3cda0..0bcc75b 100644
 -            assert!(children.is_none(), "only box nodes have layout children");
          }
      }
- 
+
      pub fn set_paint_children(&self, children: Option<ThinVec<NodeId>>) {
 -        if let Some(lists) = self.child_lists() {
 +        if let Some(lists) = self.child_lists_for(&children) {
@@ -4910,7 +5568,7 @@ index 2f3cda0..0bcc75b 100644
 -            assert!(children.is_none(), "only box nodes have paint children");
          }
      }
- 
+
 @@ -749,9 +1131,9 @@ impl Node {
      pub fn try_layout_data_mut(&mut self) -> Option<&mut LayoutData> {
          match &mut self.data {
@@ -4925,35 +5583,35 @@ index 2f3cda0..0bcc75b 100644
      }
 @@ -789,23 +1171,21 @@ impl Node {
      }
- 
+
      #[inline]
 -    pub fn unrounded_layout(&self) -> &Layout {
 -        &self.layout_data().unrounded_layout
 +    pub fn unrounded_layout(&self) -> Layout {
 +        self.layout_data().unrounded_layout()
      }
- 
+
 -    #[inline]
 -    pub fn unrounded_layout_mut(&mut self) -> &mut Layout {
 -        &mut self.layout_data_mut().unrounded_layout
 +    pub fn set_unrounded_layout(&mut self, layout: &Layout) {
 +        self.layout_data_mut().set_unrounded_layout(layout);
      }
- 
+
      #[inline]
 -    pub fn final_layout(&self) -> &Layout {
 -        &self.layout_data().final_layout
 +    pub fn final_layout(&self) -> Layout {
 +        self.layout_data().final_layout()
      }
- 
+
 -    #[inline]
 -    pub fn final_layout_mut(&mut self) -> &mut Layout {
 -        &mut self.layout_data_mut().final_layout
 +    pub fn set_final_layout(&mut self, layout: &Layout) {
 +        self.layout_data_mut().set_final_layout(layout);
      }
- 
+
      /// The post-layout shift baked into `final_layout().location`
 @@ -829,8 +1209,7 @@ impl Node {
          if dx == 0.0 && dy == 0.0 {
@@ -4981,7 +5639,7 @@ index 2f3cda0..0bcc75b 100644
              _ => None,
          }
      }
- 
+
      #[inline]
 -    pub fn try_stylo_element_data_mut(&mut self) -> Option<&mut StyloData> {
 +    pub fn try_stylo_element_data_mut(&mut self) -> Option<StyloDataMut<'_>> {
@@ -4995,7 +5653,7 @@ index 2f3cda0..0bcc75b 100644
              _ => None,
          }
      }
- 
+
 -    /// The `dirty_descendants` flag, if this node kind carries it (element or
 -    /// document nodes). Returns `None` for text/comment nodes.
 +    /// Style data from stylo. Panics on node kinds without it (see
@@ -5013,7 +5671,7 @@ index 2f3cda0..0bcc75b 100644
 +        self.try_stylo_element_data()
 +            .expect("`stylo_element_data` is not available on this node kind")
      }
- 
+
 -    /// The `damaged_descendants` flag, if this node kind carries it (element or
 -    /// document nodes). Returns `None` for text/comment nodes.
      #[inline]
@@ -5037,7 +5695,7 @@ index 2f3cda0..0bcc75b 100644
              _ => None,
          }
      }
- 
+
 +    /// Whether Stylo has processed this node's snapshot. Panics on node kinds
 +    /// that cannot be snapshotted.
 +    #[inline]
@@ -5060,7 +5718,7 @@ index 2f3cda0..0bcc75b 100644
 @@ -962,17 +1354,233 @@ impl Node {
          Self {
              tree,
- 
+
 -            id,
 -            parent: OptNodeId::default(),
 -            children: ThinVec::new(),
@@ -5068,7 +5726,7 @@ index 2f3cda0..0bcc75b 100644
 +            links: Cell::new(LAYOUT_NONE),
 +            children: super::child_list::ChildList::new(),
              rare: OnceCell::new(),
- 
+
 -            flags: NodeFlags::empty(),
 +            flags: {
 +                let index = slot_index(id);
@@ -5078,7 +5736,7 @@ index 2f3cda0..0bcc75b 100644
              data,
          }
      }
- 
+
 +    /// Our id. Only meaningful while the node is live in its tree: a node taken out by a
 +    /// removal reads its freed slot's version as 0, so keep the id it was removed by instead.
 +    #[inline]
@@ -5318,7 +5976,7 @@ index 2f3cda0..0bcc75b 100644
              .map(|style| style.clone_white_space_collapse());
          match white_space_collapse {
 @@ -1121,21 +1727,21 @@ impl Node {
- 
+
      /// Returns whether this node has any descendants that need restyling.
      pub fn has_dirty_descendants(&self) -> bool {
 -        self.dirty_descendants_flag()
@@ -5326,7 +5984,7 @@ index 2f3cda0..0bcc75b 100644
 +        self.state_flags()
 +            .is_some_and(|flags| flags.dirty_descendants())
      }
- 
+
      /// Sets the dirty_descendants flag on this node.
      pub fn set_dirty_descendants(&self) {
 -        if let Some(flag) = self.dirty_descendants_flag() {
@@ -5335,7 +5993,7 @@ index 2f3cda0..0bcc75b 100644
 +            flags.set_dirty_descendants(true);
          }
      }
- 
+
      /// Clears the dirty_descendants flag on this node.
      pub fn unset_dirty_descendants(&self) {
 -        if let Some(flag) = self.dirty_descendants_flag() {
@@ -5344,7 +6002,7 @@ index 2f3cda0..0bcc75b 100644
 +            flags.set_dirty_descendants(false);
          }
      }
- 
+
 @@ -1148,8 +1754,8 @@ impl Node {
              let parent = &self.tree()[parent_id];
              // If this ancestor already has dirty_descendants set, we can stop
@@ -5363,7 +6021,7 @@ index 2f3cda0..0bcc75b 100644
 -        self.parent.get()
 +        self.parent_id()
      }
- 
+
      /// Returns whether this node or any of its descendants may carry damage.
      pub fn has_damaged_descendants(&self) -> bool {
 -        self.damaged_descendants_flag()
@@ -5371,7 +6029,7 @@ index 2f3cda0..0bcc75b 100644
 +        self.state_flags()
 +            .is_some_and(|flags| flags.damaged_descendants())
      }
- 
+
      /// Clears the damaged_descendants flag on this node.
      pub fn unset_damaged_descendants(&self) {
 -        if let Some(flag) = self.damaged_descendants_flag() {
@@ -5380,7 +6038,7 @@ index 2f3cda0..0bcc75b 100644
 +            flags.set_damaged_descendants(false);
          }
      }
- 
+
 @@ -1189,8 +1795,8 @@ impl Node {
      /// processing such as pseudo-element style syncing), then it and all of
      /// its ancestors have `damaged_descendants` set.
@@ -5405,15 +6063,15 @@ index 2f3cda0..0bcc75b 100644
              }
 @@ -1460,10 +2066,10 @@ pub enum NodeData {
      Document(Box<DocumentData>),
- 
+
      /// An element with attributes.
 -    Element(Box<ElementData>),
 +    Element(PoolBox<ElementData>),
- 
+
      /// An anonymous block box
 -    AnonymousBlock(Box<ElementData>),
 +    AnonymousBlock(PoolBox<ElementData>),
- 
+
      /// A text node.
      Text(TextNodeData),
 @@ -1488,6 +2094,9 @@ pub enum NodeData {
@@ -5423,11 +6081,11 @@ index 2f3cda0..0bcc75b 100644
 +// The node's id lives in the tree's slot index and version table, not in each node.
 +#[cfg(target_pointer_width = "32")]
 +const _: () = assert!(std::mem::size_of::<Node>() <= 32);
- 
+
  impl NodeData {
      pub fn downcast_element(&self) -> Option<&ElementData> {
 @@ -1547,13 +2156,16 @@ impl NodeData {
- 
+
  #[derive(Debug, Clone)]
  pub struct TextNodeData {
 -    /// The textual content of the text node
@@ -5436,7 +6094,7 @@ index 2f3cda0..0bcc75b 100644
 +    /// three quarters of a typical document's text nodes without an allocation.
 +    pub content: compact_str::CompactString,
  }
- 
+
  impl TextNodeData {
 -    pub fn new(content: String) -> Self {
 -        Self { content }
@@ -5446,7 +6104,7 @@ index 2f3cda0..0bcc75b 100644
 +        }
      }
  }
- 
+
 @@ -1595,35 +2207,39 @@ impl Node {
          println!(
              "{} {} {:?} {} {:?}",
@@ -5467,13 +6125,13 @@ index 2f3cda0..0bcc75b 100644
              child.print_tree(level + 1)
          }
      }
- 
+
      // Get the index of the current node in the parents child list
      pub fn index_of_child(&self, child_id: NodeId) -> Option<usize> {
 -        self.children.iter().position(|id| *id == child_id)
 +        self.children().position(child_id)
      }
- 
+
      // Get the index of the current node in the parents child list
      pub fn child_index(&self) -> Option<usize> {
 -        let parent_id = self.parent.get()?;
@@ -5510,12 +6168,12 @@ index 2f3cda0..0bcc75b 100644
 -            .map(|id| self.with(*id))
 +            .map(|id| self.with(id))
      }
- 
+
      pub fn backward(&self, n: usize) -> Option<&Node> {
 @@ -1643,10 +2259,10 @@ impl Node {
              return None;
          }
- 
+
 -        self.tree()[self.parent.get()?]
 -            .children
 +        self.tree()[self.parent_id()?]
@@ -5524,7 +6182,7 @@ index 2f3cda0..0bcc75b 100644
 -            .map(|id| self.with(*id))
 +            .map(|id| self.with(id))
      }
- 
+
      pub fn is_element(&self) -> bool {
 @@ -1674,29 +2290,29 @@ impl Node {
      /// Nearest enclosing shadow root's node id, walking light parents.
@@ -5542,7 +6200,7 @@ index 2f3cda0..0bcc75b 100644
          }
          None
      }
- 
+
      /// Flat-tree children for layout/paint: hosts render their shadow
      /// root's children; slots their assigned nodes (children=fallback).
 -    pub fn flat_children(&self) -> &[NodeId] {
@@ -5560,7 +6218,7 @@ index 2f3cda0..0bcc75b 100644
 -        &self.children
 +        self.children()
      }
- 
+
      /// True for HTML <slot> elements (flat-tree projection points).
 @@ -1932,7 +2548,7 @@ impl Node {
      // assigned slot (dir-shadow-03/04/31: dir=rtl on the slot gives
@@ -5573,7 +6231,7 @@ index 2f3cda0..0bcc75b 100644
              if let Some(el) = node.data.downcast_element() {
 @@ -1959,7 +2575,7 @@ impl Node {
      }
- 
+
      fn directionality_flat_parent(&self) -> Option<NodeId> {
 -        let parent_id = self.parent.get()?;
 +        let parent_id = self.parent_id()?;
@@ -5691,10 +6349,10 @@ index 2f3cda0..0bcc75b 100644
 -            .or_else(|| self.layout_parent.get())
 +            .or_else(|| self.layout_parent_id())
      }
- 
+
      /// Computes the Document-relative coordinates of the `Node`
 @@ -2700,16 +3316,16 @@ impl Node {
- 
+
          // Walk up the DOM parent chain from `id` to check whether it is (or is
          // inside) the target node, stopping at the inline root.
 -        let inline_root_id = inline_root.id;
@@ -5721,7 +6379,7 @@ index 2f3cda0..0bcc75b 100644
 +        self.id() == other.id()
      }
  }
- 
+
 @@ -2922,10 +3538,10 @@ impl std::fmt::Debug for Node {
      fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
          // FIXME: update to reflect changes to fields
@@ -5747,7 +6405,7 @@ index 2f3cda0..0bcc75b 100644
 +            vec![Attribute::new(qual_name!("disabled"), "")],
          ))));
          let node = document.get_node(node).unwrap();
- 
+
 @@ -2964,9 +3580,9 @@ mod test {
      #[test]
      fn ignore_disabled_attr_content() {
@@ -5759,7 +6417,7 @@ index 2f3cda0..0bcc75b 100644
 +            vec![Attribute::new(qual_name!("disabled"), "false")],
          ))));
          let node = document.get_node(node).unwrap();
- 
+
 @@ -2983,9 +3599,9 @@ mod test {
      #[test]
      fn create_node_with_ignored_disable() {
@@ -5771,7 +6429,7 @@ index 2f3cda0..0bcc75b 100644
 +            vec![Attribute::new(qual_name!("disabled"), "")],
          ))));
          let node = document.get_node(node).unwrap();
- 
+
 @@ -3002,7 +3618,7 @@ mod test {
      #[test]
      fn create_empty_enabled_node() {
@@ -5808,7 +6466,7 @@ index 962f610..65dad41 100644
 -                .any(|&child_id| self.tree()[child_id].subtree_contains(needle))
 +                .any(|child_id| self.tree()[child_id].subtree_contains(needle))
      }
- 
+
      /// Return the inline snapshot ID for a descendant, or `None` when it is outside this SVG.
 @@ -207,7 +207,7 @@ impl Node {
      /// Return `None` when `target` is not a descendant element.
@@ -5840,7 +6498,7 @@ index 962f610..65dad41 100644
                          // Documents are parsed with scripting disabled, so `<noscript>` is not raw text
 @@ -415,7 +414,7 @@ impl Node {
                  }
- 
+
                  if has_children {
 -                    for &child_id in &self.children {
 +                    for child_id in self.children() {
@@ -5877,9 +6535,9 @@ index e221f5c..4a63897 100644
 +use std::sync::atomic::{AtomicU32, Ordering};
  use style::data::{ElementDataMut, ElementDataRef, ElementDataWrapper};
  use style::servo_arc::Arc;
- 
+
  use crate::layout::damage::ALL_DAMAGE;
- 
+
 -/// Interior-mutable wrapper around `Option<ElementDataWrapper>`.
 +/// Per-node atomic state word of element and document nodes.
  ///
@@ -6009,7 +6667,7 @@ index e221f5c..4a63897 100644
 +pub struct StyloCell {
 +    inner: UnsafeCell<ElementDataWrapper>,
  }
- 
+
 -impl Default for StyloData {
 +impl Default for StyloCell {
      fn default() -> Self {
@@ -6019,7 +6677,7 @@ index e221f5c..4a63897 100644
          }
      }
  }
- 
+
 -impl fmt::Debug for StyloData {
 +impl fmt::Debug for StyloCell {
      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -6027,7 +6685,7 @@ index e221f5c..4a63897 100644
 +        f.debug_struct("StyloCell").finish_non_exhaustive()
      }
  }
- 
+
 -impl Deref for StyloData {
 -    type Target = Option<ElementDataWrapper>;
 -    fn deref(&self) -> &Self::Target {
@@ -6047,7 +6705,7 @@ index e221f5c..4a63897 100644
 +    cell: &'a StyloCell,
 +    flags: &'a NodeStateFlags,
  }
- 
+
 -impl DerefMut for StyloData {
 -    fn deref_mut(&mut self) -> &mut Self::Target {
 -        self.inner.get_mut()
@@ -6056,7 +6714,7 @@ index e221f5c..4a63897 100644
 +        f.debug_struct("StyloData").finish_non_exhaustive()
      }
  }
- 
+
 -impl StyloData {
 -    /// Whether element data has been initialized.
 -    pub fn has_data(&self) -> bool {
@@ -6066,7 +6724,7 @@ index e221f5c..4a63897 100644
 +    pub(crate) fn new(cell: &'a StyloCell, flags: &'a NodeStateFlags) -> Self {
 +        Self { cell, flags }
      }
- 
+
 -    /// Borrow the element data immutably, if present.
 -    pub fn get(&self) -> Option<ElementDataRef<'_>> {
 -        self.as_ref().map(|w| w.borrow())
@@ -6077,7 +6735,7 @@ index e221f5c..4a63897 100644
 +        // no outstanding borrows, or through `&mut StyloCell`.
 +        unsafe { &*self.cell.inner.get() }
      }
- 
+
 -    /// Borrow the element data mutably, if present.
 -    pub fn get_mut(&mut self) -> Option<ElementDataMut<'_>> {
 -        self.as_mut().map(|w| w.borrow_mut())
@@ -6085,7 +6743,7 @@ index e221f5c..4a63897 100644
 +    fn wrapper(self) -> Option<&'a ElementDataWrapper> {
 +        self.has_data().then(|| self.wrapper_unchecked())
      }
- 
+
 -    /// Initialize the element data ready for use (if it is not already initialized)
 -    pub fn ensure_init_mut(&mut self) -> ElementDataMut<'_> {
 -        // SAFETY:
@@ -6101,7 +6759,7 @@ index e221f5c..4a63897 100644
 +    pub fn get(self) -> Option<ElementDataRef<'a>> {
 +        self.wrapper().map(|w| w.borrow())
      }
- 
+
 -    pub fn primary_styles(&self) -> Option<StyleDataRef<'_>> {
 +    pub fn primary_styles(self) -> Option<StyleDataRef<'a>> {
          // One borrow, not two: paint calls this per element and per glyph
@@ -6109,13 +6767,13 @@ index e221f5c..4a63897 100644
          let data = self.get()?;
 @@ -80,14 +206,13 @@ impl StyloData {
      }
- 
+
      /// Borrow the primary computed style directly (rather than the `Arc` containing it).
 -    pub fn computed_styles(&self) -> Option<ComputedStyleRef<'_>> {
 +    pub fn computed_styles(self) -> Option<ComputedStyleRef<'a>> {
          self.primary_styles().map(ComputedStyleRef)
      }
- 
+
      /// Get a mutable reference to the data
 -    pub unsafe fn unsafe_stylo_only_mut(&self) -> Option<ElementDataMut<'_>> {
 -        let opt = unsafe { &mut *self.inner.get() };
@@ -6123,7 +6781,7 @@ index e221f5c..4a63897 100644
 +    pub unsafe fn unsafe_stylo_only_mut(self) -> Option<ElementDataMut<'a>> {
 +        self.wrapper().map(|w| w.borrow_mut())
      }
- 
+
      /// Initialize the element data ready for use (if it is not already initialized)
 @@ -95,15 +220,17 @@ impl StyloData {
      /// SAFETY:
@@ -6148,7 +6806,7 @@ index e221f5c..4a63897 100644
          }
 +        data_mut
      }
- 
+
      /// Clear the element data, returning to the uninitialized state.
 @@ -111,8 +238,53 @@ impl StyloData {
      /// SAFETY:
@@ -6205,7 +6863,7 @@ index e221f5c..4a63897 100644
 +        data_mut
      }
  }
- 
+
 @@ -138,3 +310,134 @@ impl Deref for ComputedStyleRef<'_> {
          self.0.0.styles.get_primary().unwrap()
      }
@@ -6341,6 +6999,131 @@ index e221f5c..4a63897 100644
 +        assert_eq!(state(&doc.clone().state_flags), (false, true, true, false));
 +    }
 +}
+diff --git a/src/node/text.rs b/src/node/text.rs
+index 97167e8..ef8436e 100644
+--- a/src/node/text.rs
++++ b/src/node/text.rs
+@@ -45,9 +45,10 @@ pub struct TextLayout {
+     /// Set by every read; the eviction scan spares a far layout that was read
+     /// since its last visit once, so a layout queried every frame stays live.
+     recently_read: ReadFlag,
+-    /// Sequence number of this root's latest entry in the layout pass's
+-    /// eviction window, so older entries for it are skipped.
+-    pub(crate) in_pass_seq: u32,
++    /// The low 31 bits: sequence number of this root's latest entry in the layout pass's
++    /// eviction window, so older entries for it are skipped. The top bit: the document's
++    /// `inline_roots` index holds this root, which it does while the node holds this layout.
++    seq_and_indexed: u32,
+     /// Block-axis offset (in CSS px) of the line boxes from the top of the container's content
+     /// box, as applied by `align-content`.
+     pub block_offset: f32,
+@@ -143,6 +144,25 @@ impl Default for TextLayout {
+ }
+
+ impl TextLayout {
++    /// The top bit of `seq_and_indexed`; pass sequence numbers stay below it.
++    pub(crate) const ROOT_INDEXED: u32 = 1 << 31;
++
++    pub(crate) fn in_pass_seq(&self) -> u32 {
++        self.seq_and_indexed & !Self::ROOT_INDEXED
++    }
++
++    pub(crate) fn set_in_pass_seq(&mut self, seq: u32) {
++        debug_assert_eq!(seq & Self::ROOT_INDEXED, 0);
++        self.seq_and_indexed = (self.seq_and_indexed & Self::ROOT_INDEXED) | seq;
++    }
++
++    /// Marks the root as held by the `inline_roots` index; true if it already was.
++    pub(crate) fn mark_root_indexed(&mut self) -> bool {
++        let was = self.seq_and_indexed & Self::ROOT_INDEXED != 0;
++        self.seq_and_indexed |= Self::ROOT_INDEXED;
++        was
++    }
++
+     /// A layout holding neither text nor lines, for box construction to
+     /// build or leave unbuilt next: an empty box would be freed unread.
+     pub(crate) fn unfilled() -> Self {
+@@ -153,7 +173,7 @@ impl TextLayout {
+             evicted: None,
+             replayable_break: false,
+             recently_read: ReadFlag::default(),
+-            in_pass_seq: 0,
++            seq_and_indexed: 0,
+             block_offset: 0.0,
+             span_cb_flags: stylo_taffy::StyleFlags::empty(),
+             // NaN = no lines yet; the repair scan gives it some once
+@@ -256,8 +276,56 @@ impl EvictedBreak {
+ pub(crate) struct EvictedSummary {
+     /// Breaks the lines at another width.
+     pub(crate) lines: parley::BreakSummary,
++    /// `None` when the root has no inline boxes. A thin box keeps every
++    /// evicted root's state within its wasm32 chunk.
++    pub(crate) out_of_flow: Option<Box<OutOfFlow>>,
++}
++
++impl EvictedSummary {
+     /// The root's inline boxes, all absolutely positioned, in layout order.
+-    pub(crate) out_of_flow: Box<[NodeId]>,
++    pub(crate) fn out_of_flow_ids(&self) -> &[NodeId] {
++        self.out_of_flow.as_deref().map_or(&[], |oof| &oof.ids)
++    }
++}
++
++#[derive(Clone)]
++pub(crate) struct OutOfFlow {
++    pub(crate) ids: Box<[NodeId]>,
++    /// Kept when a box's static position depends on where along its line it
++    /// sits, which only the shaped line knows.
++    pub(crate) static_x: Option<StaticX>,
++}
++
++/// The inline offset of each out-of-flow box in its line, in layout units, as
++/// the live layout placed it when broken and aligned with `aligned`. A pass
++/// with other inputs rebuilds the root instead.
++#[derive(Clone)]
++pub(crate) struct StaticX {
++    pub(crate) aligned: AlignInputs,
++    /// Per box in [`EvictedSummary::out_of_flow_ids`] order.
++    pub(crate) x: Box<[f32]>,
++}
++
++/// The inputs that place items along a broken line. Floats compare by bits,
++/// so the recorded offsets are only reused for identical inputs.
++#[derive(Clone, Copy)]
++pub(crate) struct AlignInputs {
++    pub(crate) max_advance: f32,
++    pub(crate) indent: (f32, IndentOptions),
++    pub(crate) alignment: Option<Alignment>,
++    pub(crate) last_line_alignment: Option<Alignment>,
++    pub(crate) clamp_lines: Option<usize>,
++}
++
++impl PartialEq for AlignInputs {
++    fn eq(&self, other: &Self) -> bool {
++        self.max_advance.to_bits() == other.max_advance.to_bits()
++            && self.indent.0.to_bits() == other.indent.0.to_bits()
++            && self.indent.1 == other.indent.1
++            && self.alignment == other.alignment
++            && self.last_line_alignment == other.last_line_alignment
++            && self.clamp_lines == other.clamp_lines
++    }
+ }
+
+ /// An [`EvictedSummary`] that a rebuild, which only borrows the layout, can
+@@ -290,7 +358,12 @@ impl SummaryCell {
+             .unwrap_or_else(std::sync::PoisonError::into_inner)
+             .as_ref()
+             .map_or(0, |summary| {
+-                summary.lines.heap_size() + size_of_val(&*summary.out_of_flow)
++                let oof = summary.out_of_flow.as_deref().map_or(0, |oof| {
++                    size_of::<OutOfFlow>()
++                        + size_of_val(&*oof.ids)
++                        + oof.static_x.as_ref().map_or(0, |s| size_of_val(&*s.x))
++                });
++                summary.lines.heap_size() + oof
+             })
+     }
+ }
 diff --git a/src/pool.rs b/src/pool.rs
 new file mode 100644
 index 0000000..24d9d7e
@@ -6552,20 +7335,20 @@ index aa38612..f52b234 100644
 @@ -197,7 +197,7 @@ impl BaseDocument {
              self.may_use_invalidation_for(scope),
          );
- 
+
 -        result.map(|node| node.id)
 +        result.map(|node| node.id())
      }
- 
+
      /// Find all nodes that match the selector specified as a string
 @@ -258,7 +258,7 @@ impl BaseDocument {
              self.may_use_invalidation_for(scope),
          );
- 
+
 -        results.iter().map(|node| node.id).collect()
 +        results.iter().map(|node| node.id()).collect()
      }
- 
+
      fn may_use_invalidation_for(&self, scope: NodeId) -> MayUseInvalidation {
 @@ -350,7 +350,7 @@ impl Node {
              &mut result,
@@ -6574,7 +7357,7 @@ index aa38612..f52b234 100644
 -        result.map(|node| node.id)
 +        result.map(|node| node.id())
      }
- 
+
      /// Find all descendants of this node that match the selector(s) specified
 @@ -371,7 +371,7 @@ impl Node {
              &mut results,
@@ -6583,18 +7366,18 @@ index aa38612..f52b234 100644
 -        results.iter().map(|node| node.id).collect()
 +        results.iter().map(|node| node.id()).collect()
      }
- 
+
      /// Test whether this element matches the selector(s) specified in
 @@ -394,6 +394,6 @@ impl Node {
              return None;
          }
- 
+
 -        element_closest(self, selector_list, self.owner_doc().quirks_mode()).map(|node| node.id)
 +        element_closest(self, selector_list, self.owner_doc().quirks_mode()).map(|node| node.id())
      }
  }
 diff --git a/src/resolve.rs b/src/resolve.rs
-index c4a0628..f1c5432 100644
+index c4a0628..b073f63 100644
 --- a/src/resolve.rs
 +++ b/src/resolve.rs
 @@ -58,7 +58,7 @@ impl UndisplayedLayoutTraversal {
@@ -6609,28 +7392,28 @@ index c4a0628..f1c5432 100644
 @@ -189,7 +189,7 @@ impl BaseDocument {
                  .retain(|_, last| last.elapsed() < FADE_DELAY + FADE_DURATION);
          }
- 
+
 -        let root_node_id = self.root_element().id;
 +        let root_node_id = self.root_element().id();
          debug_timer!(timer, feature = "log-phase-times");
- 
+
          // Apply any device changes (viewport resize, zoom, color-scheme, etc)
 @@ -344,7 +344,7 @@ impl BaseDocument {
- 
+
          // Clear all damage and dirty flags, walking only subtrees which are
          // marked as (potentially) containing damage.
 -        let doc_node_id = self.root_node().id;
 +        let doc_node_id = self.root_node().id();
          self.clear_damage_and_dirty_flags(doc_node_id);
          timer.record_time("c_damage");
- 
+
 @@ -598,7 +598,7 @@ impl BaseDocument {
      }
- 
+
      pub fn resolve_layout_children(&mut self) {
 -        resolve_layout_children_recursive(self, self.root_node().id);
 +        resolve_layout_children_recursive(self, self.root_node().id());
- 
+
          fn resolve_layout_children_recursive(doc: &mut BaseDocument, node_id: NodeId) {
              // Anonymous blocks and pseudo-elements can be removed from the slab
 @@ -673,7 +673,7 @@ impl BaseDocument {
@@ -6645,7 +7428,7 @@ index c4a0628..f1c5432 100644
 @@ -683,6 +683,21 @@ impl BaseDocument {
                      }
                  }
- 
+
 +                // Child links are bare slot indexes, so a child that dropped out of this
 +                // list must not keep one to us: once our slot is reused, that index names
 +                // the new occupant. Clear the ones this pass did not re-collect.
@@ -6662,7 +7445,7 @@ index c4a0628..f1c5432 100644
 +                    }
 +                }
                  doc.nodes[node_id].set_layout_children(Some(layout_children.clone()));
- 
+
                  damage.remove(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
 @@ -698,7 +713,7 @@ impl BaseDocument {
                              continue;
@@ -6671,7 +7454,7 @@ index c4a0628..f1c5432 100644
 -                        doc.nodes[child_id].layout_parent.set(Some(node_id));
 +                        doc.nodes[child_id].set_layout_parent_id(Some(node_id));
                      }
- 
+
                      doc.nodes[node_id].set_layout_children(Some(layout_children));
 @@ -726,9 +741,13 @@ impl BaseDocument {
              let anonymous_blocks = node.take_anonymous_blocks();
@@ -6706,16 +7489,57 @@ index c4a0628..f1c5432 100644
                      Some(parent_id),
                      "layout_parent of {child_id:?} does not point at its layout container {parent_id:?}"
                  );
-@@ -897,7 +916,7 @@ impl BaseDocument {
+@@ -797,12 +816,14 @@ impl BaseDocument {
+                     scale: self.viewport.scale(),
+                     breaking: None,
+                 });
++                layout.mark_root_indexed();
+                 self.nodes[task.node_id].clear_layout_cache();
+                 self.nodes[task.node_id]
+                     .element_data_mut()
+                     .unwrap()
+                     .set_inline_layout_data(Some(layout));
+                 self.inline_roots.push(task.node_id);
++                self.inline_roots_put = true;
+             }
+             return;
+         }
+@@ -869,13 +890,15 @@ impl BaseDocument {
+
+         for result in results {
+             match result.data {
+-                ConstructionTaskResultData::InlineLayout(layout) => {
++                ConstructionTaskResultData::InlineLayout(mut layout) => {
++                    layout.mark_root_indexed();
+                     self.nodes[result.node_id].clear_layout_cache();
+                     self.nodes[result.node_id]
+                         .element_data_mut()
+                         .unwrap()
+                         .set_inline_layout_data(Some(layout));
+                     self.inline_roots.push(result.node_id);
++                    self.inline_roots_put = true;
+                 }
+             }
+         }
+@@ -897,7 +920,7 @@ impl BaseDocument {
              height: AvailableSpace::Definite(size.height.to_f32_px()),
          };
- 
+
 -        let root_element_id = crate::taffy_node_id(self.root_element().id);
 +        let root_element_id = crate::taffy_node_id(self.root_element().id());
- 
+
          // println!("\n\nRESOLVE LAYOUT\n===========\n");
- 
-@@ -932,7 +951,7 @@ impl BaseDocument {
+
+@@ -918,7 +941,7 @@ impl BaseDocument {
+         //
+         // Except a rebuilt inline tree has no lines, and the restore pass below
+         // re-breaks it against final_layout, which must not be a stale box.
+-        if state.layout_changed || state.inline_roots.len() != state.inline_roots_settled {
++        if state.layout_changed || state.inline_roots_put {
+             #[cfg(feature = "writing-mode")]
+             state.physicalise_and_round_layout(root_element_id);
+             #[cfg(not(feature = "writing-mode"))]
+@@ -932,7 +955,7 @@ impl BaseDocument {
                  let Some(element) = node.element_data() else {
                      continue;
                  };
@@ -6724,7 +7548,32 @@ index c4a0628..f1c5432 100644
                      continue;
                  };
                  let Some(mut grid_info) = table.computed_grid_info.borrow().clone() else {
-@@ -1065,7 +1084,7 @@ mod undisplayed_layout_tests {
+@@ -988,7 +1011,7 @@ impl BaseDocument {
+     fn restore_clobbered_inline_breaks(&mut self) {
+         // Debug builds run the walk anyway and assert it finds nothing, so
+         // every test exercises the skip predicate rather than trusting it.
+-        let skip = !self.layout_changed && self.inline_roots.len() == self.inline_roots_settled;
++        let skip = !self.layout_changed && !self.inline_roots_put;
+         if skip && !cfg!(debug_assertions) {
+             return;
+         }
+@@ -1036,8 +1059,15 @@ impl BaseDocument {
+             }
+             true
+         });
++        // Construction pushes every root again, so a rebuild of the whole
++        // page can leave the capacity several times the deduplicated length,
++        // and growth by doubling alone can leave up to twice it.
++        if roots.capacity() > roots.len() + roots.len() / 4 {
++            roots.shrink_to(roots.len() + roots.len() / 8);
++        }
+         self.inline_roots_settled = roots.len();
+         self.inline_roots = roots;
++        self.inline_roots_put = false;
+         debug_assert!(
+             !skip || stale.is_empty(),
+             "skipped a resolve with {} stale inline roots: {stale:?}",
+@@ -1065,7 +1095,7 @@ mod undisplayed_layout_tests {
              viewport: Some(Viewport::new(400, 300, 1.0, ColorScheme::Light)),
              ..Default::default()
          });
@@ -6733,7 +7582,7 @@ index c4a0628..f1c5432 100644
          let block_style = || Attribute::new(qual_name!("style"), "display:block".to_string());
          let mut mutator = doc.mutate();
          let html = mutator.create_element(qual_name!("html"), vec![block_style()]);
-@@ -1118,6 +1137,7 @@ mod undisplayed_layout_tests {
+@@ -1118,6 +1148,7 @@ mod undisplayed_layout_tests {
              .element_data()
              .unwrap()
              .layout_data
@@ -6741,7 +7590,7 @@ index c4a0628..f1c5432 100644
              .is_some());
          doc.mutate()
              .set_attribute(outer, qual_name!("style"), "display:none");
-@@ -1126,6 +1146,7 @@ mod undisplayed_layout_tests {
+@@ -1126,6 +1157,7 @@ mod undisplayed_layout_tests {
              .element_data()
              .unwrap()
              .layout_data
@@ -6759,7 +7608,7 @@ index f0ca596..78f222f 100644
                      .and_then(|id| self.get_node(id))
 -                    .map(|parent| *parent.final_layout());
 +                    .map(|parent| parent.final_layout());
- 
+
                  match position {
                      // Used value: the relative offset. An `auto` side resolves
 @@ -698,14 +698,14 @@ impl BaseDocument {
@@ -6803,7 +7652,7 @@ index d5eea17..ad4a5d9 100644
              }
 @@ -299,8 +299,8 @@ impl BaseDocument {
                  }
- 
+
                  if let Some(root) = self.try_root_element() {
 -                    let root_id = root.id;
 -                    let layout = *root.final_layout();
@@ -6815,7 +7664,7 @@ index d5eea17..ad4a5d9 100644
 @@ -332,7 +332,7 @@ impl BaseDocument {
                      return false;
                  }
- 
+
 -                let layout = *node.final_layout();
 +                let layout = node.final_layout();
                  self.nodes.bump_geometry_generation();
@@ -6840,29 +7689,29 @@ index d5eea17..ad4a5d9 100644
                  true
              }
 diff --git a/src/stylo.rs b/src/stylo.rs
-index 5529875..1a665a3 100644
+index 5f3103f..5e4fe78 100644
 --- a/src/stylo.rs
 +++ b/src/stylo.rs
-@@ -533,15 +533,15 @@ impl<'a> TNode for BlitzNode<'a> {
+@@ -553,15 +553,15 @@ impl<'a> TNode for BlitzNode<'a> {
      type ConcreteShadowRoot = BlitzNode<'a>;
- 
+
      fn parent_node(&self) -> Option<Self> {
 -        self.parent.get().map(|id| self.with(id))
 +        self.parent_id().map(|id| self.with(id))
      }
- 
+
      fn first_child(&self) -> Option<Self> {
 -        self.children.first().map(|id| self.with(*id))
 +        self.children().first().map(|id| self.with(id))
      }
- 
+
      fn last_child(&self) -> Option<Self> {
 -        self.children.last().map(|id| self.with(*id))
 +        self.children().last().map(|id| self.with(id))
      }
- 
+
      fn prev_sibling(&self) -> Option<Self> {
-@@ -555,7 +555,7 @@ impl<'a> TNode for BlitzNode<'a> {
+@@ -575,7 +575,7 @@ impl<'a> TNode for BlitzNode<'a> {
      fn owner_doc(&self) -> Self::ConcreteDocument {
          // Walk up the (layout-)parent chain to the root Document node.
          let mut node = *self;
@@ -6871,21 +7720,21 @@ index 5529875..1a665a3 100644
              node = node.with(parent_id);
          }
          node
-@@ -579,11 +579,11 @@ impl<'a> TNode for BlitzNode<'a> {
+@@ -599,11 +599,11 @@ impl<'a> TNode for BlitzNode<'a> {
      }
- 
+
      fn opaque(&self) -> OpaqueNode {
 -        OpaqueNode(self.id.as_u64() as usize)
 +        OpaqueNode(Node::id(self).as_u64() as usize)
      }
- 
+
      fn debug_id(self) -> usize {
 -        self.id.as_u64() as usize
 +        self.id().as_u64() as usize
      }
- 
+
      fn as_element(&self) -> Option<Self::ConcreteElement> {
-@@ -620,7 +620,7 @@ impl selectors::Element for BlitzNode<'_> {
+@@ -640,7 +640,7 @@ impl selectors::Element for BlitzNode<'_> {
          // find some other solution that will enable "rehydration". This is required to enable and use the
          // Shadow DOM functionality in Stylo.
          let non_null =
@@ -6893,18 +7742,18 @@ index 5529875..1a665a3 100644
 +            NonNull::new((Node::id(self).as_u64() as usize).wrapping_add(1) as *mut ()).unwrap();
          OpaqueElement::from_non_null_ptr(non_null)
      }
- 
-@@ -631,8 +631,7 @@ impl selectors::Element for BlitzNode<'_> {
+
+@@ -651,8 +651,7 @@ impl selectors::Element for BlitzNode<'_> {
      }
- 
+
      fn parent_node_is_shadow_root(&self) -> bool {
 -        self.parent
 -            .get()
 +        self.parent_id()
              .is_some_and(|id| self.with(id).is_shadow_root())
      }
- 
-@@ -653,24 +652,26 @@ impl selectors::Element for BlitzNode<'_> {
+
+@@ -673,24 +672,26 @@ impl selectors::Element for BlitzNode<'_> {
      // Locate self in the parent's child list once, then scan from there: stepping with
      // forward(n)/backward(n) repeated that lookup for every skipped text node.
      fn prev_sibling_element(&self) -> Option<Self> {
@@ -6922,7 +7771,7 @@ index 5529875..1a665a3 100644
 +            .map(|id| self.with(id))
              .find(|node| node.is_element())
      }
- 
+
      fn next_sibling_element(&self) -> Option<Self> {
 -        let parent = self.with(self.parent.get()?);
 +        let parent = self.with(self.parent_id()?);
@@ -6938,58 +7787,58 @@ index 5529875..1a665a3 100644
 +            .map(|id| self.with(id))
              .find(|node| node.is_element())
      }
- 
-@@ -1071,11 +1072,11 @@ impl<'a> TElement for BlitzNode<'a> {
+
+@@ -1091,11 +1092,11 @@ impl<'a> TElement for BlitzNode<'a> {
      }
- 
+
      fn handled_snapshot(&self) -> bool {
 -        self.snapshot_handled().load(Ordering::SeqCst)
 +        self.snapshot_handled()
      }
- 
+
      unsafe fn set_handled_snapshot(&self) {
 -        self.snapshot_handled().store(true, Ordering::SeqCst);
 +        self.set_snapshot_handled(true);
      }
- 
+
      // Stylo calls this on elements it is already traversing (or has already
-@@ -1198,7 +1199,7 @@ impl<'a> TElement for BlitzNode<'a> {
+@@ -1218,7 +1219,7 @@ impl<'a> TElement for BlitzNode<'a> {
          self.attrs()?
              .iter()
              .find(|a| a.name.local == attr.0 && *a.namespace() == ns.0)
 -            .map(|a| a.value.clone())
 +            .map(|a| a.value.to_string())
      }
- 
+
      fn lang_attr(&self) -> Option<style::selector_parser::AttrValue> {
-@@ -1227,7 +1228,7 @@ impl<'a> TElement for BlitzNode<'a> {
+@@ -1247,7 +1248,7 @@ impl<'a> TElement for BlitzNode<'a> {
          let root_element = TDocument::as_node(&root_node)
              .first_element_child()
              .unwrap();
 -        root_element.children.contains(&self.id)
 +        root_element.children().contains(Node::id(self))
      }
- 
+
      fn synthesize_presentational_hints_for_legacy_attributes<V>(
-@@ -1686,7 +1687,7 @@ impl<'a> Iterator for Traverser<'a> {
- 
+@@ -1706,7 +1707,7 @@ impl<'a> Iterator for Traverser<'a> {
+
      fn next(&mut self) -> Option<Self::Item> {
          let node_id = self.parent.flat_children().get(self.child_index)?;
 -        let node = self.parent.with(*node_id);
 +        let node = self.parent.with(node_id);
- 
+
          self.child_index += 1;
- 
-@@ -1696,7 +1697,7 @@ impl<'a> Iterator for Traverser<'a> {
- 
+
+@@ -1716,7 +1717,7 @@ impl<'a> Iterator for Traverser<'a> {
+
  impl std::hash::Hash for BlitzNode<'_> {
      fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
 -        state.write_u64(self.id.as_u64())
 +        state.write_u64(Node::id(self).as_u64())
      }
  }
- 
-@@ -1796,7 +1797,7 @@ impl<'dom> DomTraversal<BlitzNode<'dom>> for RecalcStyle<'_> {
+
+@@ -1816,7 +1817,7 @@ impl<'dom> DomTraversal<BlitzNode<'dom>> for RecalcStyle<'_> {
                      self.nodes_needing_style_image_flush
                          .lock()
                          .unwrap()
@@ -6997,7 +7846,133 @@ index 5529875..1a665a3 100644
 +                        .push(Node::id(el));
                  }
              }
- 
+
+diff --git a/src/stylo_to_parley.rs b/src/stylo_to_parley.rs
+index 2387f62..ecf8b22 100644
+--- a/src/stylo_to_parley.rs
++++ b/src/stylo_to_parley.rs
+@@ -566,42 +566,30 @@ pub(crate) fn has_inline_background(style: &stylo::ComputedValues) -> bool {
+             > 0.0
+ }
+
++/// [`style_borrowed`] with owned family names, for styles kept past `style`'s lifetime.
+ pub(crate) fn style(
+     span_id: NodeId,
+     style: &stylo::ComputedValues,
+ ) -> parley::TextStyle<'static, 'static, TextBrush> {
+-    let font_styles = style.get_font();
+-    let itext_styles = style.get_inherited_text();
+-
+-    // Convert font size and line height
+-    let font_size = font_styles.font_size.used_size.0.px();
+-    let line_height = match font_styles.line_height {
+-        stylo::LineHeight::Normal => parley::LineHeight::NORMAL,
+-        stylo::LineHeight::Number(num) => parley::LineHeight::FontSizeRelative(num.0),
+-        stylo::LineHeight::Length(value) => parley::LineHeight::Absolute(value.0.px()),
+-    };
+-    let vertical_align = self::vertical_align(style);
+-
+-    let letter_spacing = itext_styles
+-        .letter_spacing
+-        .0
+-        .resolve(Length::new(font_size))
+-        .px();
++    let families = font_families(style.get_font())
++        .into_iter()
++        .map(parley::FontFamilyName::into_owned)
++        .collect();
++    style_with_families(span_id, style, families)
++}
+
+-    let word_spacing = itext_styles
+-        .word_spacing
+-        .resolve(Length::new(font_size))
+-        .px();
++/// The parley style of `span_id`, borrowing family names from `style`: a builder resolves a
++/// pushed style at once, so the names need not be copied for each text span.
++pub(crate) fn style_borrowed(
++    span_id: NodeId,
++    style: &stylo::ComputedValues,
++) -> parley::TextStyle<'_, 'static, TextBrush> {
++    style_with_families(span_id, style, font_families(style.get_font()))
++}
+
+-    // Convert Bold/Italic
+-    let font_weight = self::font_weight(font_styles.font_weight);
++fn font_families(font_styles: &stylo::Font) -> Vec<parley::FontFamilyName<'_>> {
+     let font_style = self::font_style(font_styles.font_style);
+-    let font_width = self::font_width(font_styles.font_width);
+-    let font_variations = self::font_variations(&font_styles.font_variation_settings);
+-    let font_features = self::font_features(font_styles);
+-
+-    // Convert font family
+-    let families: Vec<_> = font_styles
++    font_styles
+         .font_family
+         .families
+         .list
+@@ -615,7 +603,7 @@ pub(crate) fn style(
+                     // matching would otherwise substitute a loaded sibling
+                     // of the wrong style. Dropping it here falls through to
+                     // the next family, and registration re-shapes the text.
+-                    if crate::net::face_pending_for_style(&name.to_lowercase(), font_style) {
++                    if crate::net::face_pending_for_style(name, font_style) {
+                         return None;
+                     }
+
+@@ -633,14 +621,50 @@ pub(crate) fn style(
+                         );
+                     }
+
+-                    break 'ret parley::FontFamilyName::Named(Cow::Owned(name.to_string()));
++                    break 'ret parley::FontFamilyName::Named(Cow::Borrowed(name));
+                 }
+             }
+             stylo::SingleFontFamily::Generic(generic) => {
+                 parley::FontFamilyName::Generic(self::generic_font_family(*generic))
+             }
+         }))
+-        .collect();
++        .collect()
++}
++
++fn style_with_families<'f>(
++    span_id: NodeId,
++    style: &stylo::ComputedValues,
++    families: Vec<parley::FontFamilyName<'f>>,
++) -> parley::TextStyle<'f, 'static, TextBrush> {
++    let font_styles = style.get_font();
++    let itext_styles = style.get_inherited_text();
++
++    // Convert font size and line height
++    let font_size = font_styles.font_size.used_size.0.px();
++    let line_height = match font_styles.line_height {
++        stylo::LineHeight::Normal => parley::LineHeight::NORMAL,
++        stylo::LineHeight::Number(num) => parley::LineHeight::FontSizeRelative(num.0),
++        stylo::LineHeight::Length(value) => parley::LineHeight::Absolute(value.0.px()),
++    };
++    let vertical_align = self::vertical_align(style);
++
++    let letter_spacing = itext_styles
++        .letter_spacing
++        .0
++        .resolve(Length::new(font_size))
++        .px();
++
++    let word_spacing = itext_styles
++        .word_spacing
++        .resolve(Length::new(font_size))
++        .px();
++
++    // Convert Bold/Italic
++    let font_weight = self::font_weight(font_styles.font_weight);
++    let font_style = self::font_style(font_styles.font_style);
++    let font_width = self::font_width(font_styles.font_width);
++    let font_variations = self::font_variations(&font_styles.font_variation_settings);
++    let font_features = self::font_features(font_styles);
+
+     // Wrapping and breaking
+     // `word-break: break-word` is a legacy compat value (css-text-3):
 diff --git a/src/traversal.rs b/src/traversal.rs
 index 5d81829..0f3c947 100644
 --- a/src/traversal.rs
@@ -7024,7 +7999,7 @@ index 5d81829..0f3c947 100644
 -        Self::new_with_root(doc, doc.root_node().id)
 +        Self::new_with_root(doc, doc.root_node().id())
      }
- 
+
      /// Creates a new tree traverser for the given document which starts at the specified node.
 @@ -75,7 +75,7 @@ impl Iterator for TreeTraverser<'_> {
      fn next(&mut self) -> Option<Self::Item> {
@@ -7036,7 +8011,7 @@ index 5d81829..0f3c947 100644
      }
  }
 @@ -100,7 +100,7 @@ impl Iterator for AncestorTraverser<'_> {
- 
+
      fn next(&mut self) -> Option<Self::Item> {
          let current_node = self.doc.get_node(self.current)?;
 -        self.current = current_node.parent.get()?;
@@ -7046,12 +8021,12 @@ index 5d81829..0f3c947 100644
  }
 @@ -130,10 +130,10 @@ impl BaseDocument {
              let node = &self.nodes[node_id];
- 
+
              if !node.is_anonymous() {
 -                return node.id;
 +                return node.id();
              }
- 
+
 -            let Some(parent_id) = node.layout_parent.get() else {
 +            let Some(parent_id) = node.layout_parent_id() else {
                  // Shouldn't be reachable unless invalid node_id is passed
@@ -7070,12 +8045,12 @@ index 5d81829..0f3c947 100644
 -        self.nodes[node_id].children = children;
 +        self.nodes[node_id].restore_detached_children(children);
      }
- 
+
      pub fn iter_subtree_mut(
 @@ -174,12 +174,12 @@ impl BaseDocument {
                  iter_subtree_mut_inner(doc, shadow_root_id, cb);
              }
- 
+
 -            let children = std::mem::take(&mut doc.nodes[node_id].children);
 -            for child_id in children.iter().cloned() {
 +            let children = doc.nodes[node_id].take_detached_children();
@@ -7087,7 +8062,7 @@ index 5d81829..0f3c947 100644
 +            doc.nodes[node_id].restore_detached_children(children);
          }
      }
- 
+
 @@ -225,11 +225,11 @@ impl BaseDocument {
              }
              self.nodes[src].set_assigned_nodes(Some(assigned));
@@ -7102,10 +8077,10 @@ index 5d81829..0f3c947 100644
 +            self.nodes[src].restore_detached_children(children);
          }
      }
- 
+
 @@ -258,26 +258,22 @@ impl BaseDocument {
      }
- 
+
      pub fn next_node(&self, start: &Node, mut filter: impl FnMut(&Node) -> bool) -> Option<NodeId> {
 -        let start_id = start.id;
 +        let start_id = start.id();
@@ -7138,7 +8113,7 @@ index 5d81829..0f3c947 100644
                  else {
 @@ -293,8 +289,8 @@ impl BaseDocument {
              };
- 
+
              if filter(next) {
 -                return Some(next.id);
 -            } else if next.id == start_id {
@@ -7146,7 +8121,7 @@ index 5d81829..0f3c947 100644
 +            } else if next.id() == start_id {
                  return None;
              }
- 
+
 @@ -305,8 +301,8 @@ impl BaseDocument {
      /// The node that comes last within `node`'s subtree in document order,
      /// which is what precedes `node`'s successor in reverse order.
@@ -7184,7 +8159,7 @@ index 5d81829..0f3c947 100644
                  }
 @@ -337,8 +330,8 @@ impl BaseDocument {
              };
- 
+
              if filter(prev) {
 -                return Some(prev.id);
 -            } else if prev.id == start_id {
@@ -7192,7 +8167,7 @@ index 5d81829..0f3c947 100644
 +            } else if prev.id() == start_id {
                  return None;
              }
- 
+
 @@ -357,7 +350,7 @@ impl BaseDocument {
                  break;
              }
@@ -7205,7 +8180,7 @@ index 5d81829..0f3c947 100644
 @@ -424,7 +417,7 @@ impl BaseDocument {
              return Ordering::Greater;
          }
- 
+
 -        for &child_id in &parent.children {
 +        for child_id in parent.children() {
              if child_id == divergent_a {
@@ -7244,19 +8219,19 @@ index cb675fb..27bfc00 100644
 +++ b/src/tree.rs
 @@ -1,38 +1,39 @@
  //! Versioned storage for the nodes of the DOM tree.
- 
+
 +use std::cell::RefCell;
 +use std::collections::HashMap;
 +use std::hash::{BuildHasherDefault, Hasher};
 +use std::mem::MaybeUninit;
  use std::ops::{Index, IndexMut};
  use std::sync::atomic::{AtomicU64, Ordering};
- 
+
  use blitz_traits::node_id::NodeId;
 -use slotmap::{Key as _, KeyData, SlotMap};
- 
+
  use crate::Node;
- 
+
 -slotmap::new_key_type! {
 -    /// The internal [`slotmap`] key for node storage. Only used at the
 -    /// storage boundary: all public APIs use [`NodeId`].
@@ -7274,7 +8249,7 @@ index cb675fb..27bfc00 100644
 -}
 +/// Set in a `slot_versions` entry whose slot is free, on top of the slot's last version.
 +const FREE: u32 = 0x8000_0000;
- 
+
 -/// The versioned map in which the nodes of the DOM tree are stored, backed by
 -/// a [`slotmap::SlotMap`].
 -///
@@ -7369,7 +8344,7 @@ index cb675fb..27bfc00 100644
 +    // SAFETY: the caller guarantees `tree` is live; `addr_of!` avoids a whole-tree reference.
 +    unsafe { &*std::ptr::addr_of!((*tree).layout_parents) }
  }
- 
+
 -/// The slot index of an id: the low half of the slotmap FFI encoding, which
 -/// keeps the version in the high half.
 +/// The slot index of a raw id: its low half, with the version in the high half.
@@ -7377,7 +8352,7 @@ index cb675fb..27bfc00 100644
  fn slot_index(raw: u64) -> usize {
      (raw & 0xffff_ffff) as usize
  }
- 
+
 +/// The live version in a `slot_versions` entry, 0 if the slot is free.
 +#[inline(always)]
 +fn live_version(entry: u32) -> u32 {
@@ -7430,7 +8405,7 @@ index cb675fb..27bfc00 100644
 +            layout_parents: RefCell::default(),
          }
      }
- 
+
 @@ -86,18 +168,31 @@ impl NodeTree {
      /// Stylo's animation sweep took that miss for "not in the document" and
      /// cleared the node's transitions on every resolve, so they never
@@ -7452,7 +8427,7 @@ index cb675fb..27bfc00 100644
          let stale = raw >> 32 != 0 && raw != id.as_u64();
          (!stale && self.contains_key(id)).then_some(id)
      }
- 
+
 +    /// The id of the node living in slot `index`. Nodes store their tree
 +    /// links as bare slot indexes and rebuild full ids through this.
 +    #[inline]
@@ -7469,7 +8444,7 @@ index cb675fb..27bfc00 100644
 @@ -136,66 +231,150 @@ impl NodeTree {
          self.geometry_generation.fetch_add(1, Ordering::Relaxed);
      }
- 
+
 -    pub(crate) fn with_capacity(
 -        capacity: usize,
 -        guard: style::shared_lock::SharedRwLock,
@@ -7484,7 +8459,7 @@ index cb675fb..27bfc00 100644
 +        let (chunk, offset) = split(index);
 +        Some(self.versions.get(chunk)?[offset])
      }
- 
+
 -    /// The number of live nodes in the map.
 +    #[inline(always)]
 +    fn entry_mut(&mut self, index: usize) -> &mut u32 {
@@ -7503,7 +8478,7 @@ index cb675fb..27bfc00 100644
 -        self.map.len()
 +        self.live
      }
- 
+
      pub fn is_empty(&self) -> bool {
 -        self.map.is_empty()
 +        self.live == 0
@@ -7518,13 +8493,13 @@ index cb675fb..27bfc00 100644
 +        // A live entry never has `FREE` set, so a forged `FREE` version cannot match a free slot.
 +        (version & FREE == 0 && self.entry(index) == Some(version)).then_some(index)
      }
- 
+
      /// Whether `id` resolves to a live node.
      pub fn contains_key(&self, id: NodeId) -> bool {
 -        self.map.contains_key(to_key(id))
 +        self.live_slot(id).is_some()
      }
- 
+
      /// Get a reference to the node with the given id, if it is still live.
 +    #[inline]
      pub fn get(&self, id: NodeId) -> Option<&Node> {
@@ -7534,7 +8509,7 @@ index cb675fb..27bfc00 100644
 +        // initialized.
 +        Some(unsafe { self.chunks.get_unchecked(chunk)[offset].assume_init_ref() })
      }
- 
+
      /// Get a mutable reference to the node with the given id, if it is still live.
 +    #[inline]
      pub fn get_mut(&mut self, id: NodeId) -> Option<&mut Node> {
@@ -7543,7 +8518,7 @@ index cb675fb..27bfc00 100644
 +        // SAFETY: as in `get`.
 +        Some(unsafe { self.chunks.get_unchecked_mut(chunk)[offset].assume_init_mut() })
      }
- 
+
      /// Insert a node constructed with knowledge of its own id.
      pub(crate) fn insert_with_key(&mut self, f: impl FnOnce(NodeId) -> Node) -> NodeId {
 -        let id = to_id(self.map.insert_with_key(|key| f(to_id(key))));
@@ -7575,7 +8550,7 @@ index cb675fb..27bfc00 100644
 +        self.live += 1;
          id
      }
- 
+
      /// Remove the node with the given id, returning it if it was still live.
      pub(crate) fn remove(&mut self, id: NodeId) -> Option<Node> {
 -        let node = self.map.remove(to_key(id))?;
@@ -7593,7 +8568,7 @@ index cb675fb..27bfc00 100644
 +        }
          Some(node)
      }
- 
+
 -    /// Iterate over all live `(NodeId, &Node)` pairs.
 +    /// Iterate over all live `(NodeId, &Node)` pairs, in ascending slot order.
      pub fn iter(&self) -> impl Iterator<Item = (NodeId, &Node)> {
@@ -7609,7 +8584,7 @@ index cb675fb..27bfc00 100644
 +                (id_from_parts(index as u32, version), node)
 +            })
      }
- 
+
 -    /// Iterate over all live `(NodeId, &mut Node)` pairs.
 +    /// Iterate over all live `(NodeId, &mut Node)` pairs, in ascending slot order.
      pub fn iter_mut(&mut self) -> impl Iterator<Item = (NodeId, &mut Node)> {
@@ -7641,7 +8616,7 @@ index cb675fb..27bfc00 100644
 +        }
      }
  }
- 
+
 @@ -205,7 +384,10 @@ impl Index<NodeId> for NodeTree {
      #[track_caller]
      #[inline]
@@ -7653,7 +8628,7 @@ index cb675fb..27bfc00 100644
 +        }
      }
  }
- 
+
 @@ -213,7 +395,10 @@ impl IndexMut<NodeId> for NodeTree {
      #[track_caller]
      #[inline]
@@ -7665,7 +8640,7 @@ index cb675fb..27bfc00 100644
 +        }
      }
  }
- 
+
 @@ -240,4 +425,102 @@ mod tests {
          assert_eq!(doc.nodes.id_from_opaque(index), Some(second));
          assert_eq!(doc.nodes.id_from_opaque(first.as_u64() as usize), None);
@@ -7775,13 +8750,13 @@ index 3b1d478..d1ab6b4 100644
 +++ b/src/util.rs
 @@ -230,7 +230,7 @@ pub fn walk_tree(indent: usize, node: &Node) {
      }
- 
+
      print!("{}", " ".repeat(indent));
 -    let id = node.id;
 +    let id = node.id();
      match &node.data {
          NodeData::Document(_) => println!("#Document {id}"),
- 
+
 @@ -264,7 +264,7 @@ pub fn walk_tree(indent: usize, node: &Node) {
              for attr in data.attrs.iter() {
                  print!(" {}=\"{}\"", attr.name.local, attr.value);
@@ -7794,7 +8769,7 @@ index 3b1d478..d1ab6b4 100644
 @@ -277,9 +277,9 @@ pub fn walk_tree(indent: usize, node: &Node) {
            // NodeData::ProcessingInstruction { .. } => unreachable!(),
      }
- 
+
 -    if !node.children.is_empty() {
 -        for child_id in node.children.iter() {
 -            walk_tree(indent + 2, node.with(*child_id));
@@ -7802,8 +8777,5 @@ index 3b1d478..d1ab6b4 100644
 +        for child_id in node.children().iter() {
 +            walk_tree(indent + 2, node.with(child_id));
          }
- 
-         if let NodeData::Element(data) = &node.data {
--- 
-2.54.0 (Apple Git-157)
 
+         if let NodeData::Element(data) = &node.data {

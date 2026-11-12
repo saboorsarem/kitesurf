@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bpereira <bpereira@cloudflare.com>
+Date: Thu, 12 Nov 2026 22:08:31 +0000
+Subject: [PATCH] Tighten selector invalidation, calc alignment and style
+ sharing
+
+Record whether any relative selector reaches a later sibling: an embedder that
+cannot seed sibling search directions on a freshly inserted element needs a
+whole-parent restyle only when some :has() starts with + or ~, and the existing
+used flag is set for any :has(), so it cannot tell the two apart.
+
+Align computed calc values for Taffy's tagged pointers: Taffy's CompactLength keeps
+its tag in the low three bits of a pointer to the calc value, and on wasm32 the
+struct only asked for 4-byte alignment, which held only because dlmalloc rounds
+every chunk to 8. An allocator that honours the requested alignment failed Taffy's
+assertion and left calc() insets unresolved.
+
+Share more styles between links and cousins: with visited styles disabled a link's
+style depends only on its rules and parent, so links are no longer refused the
+sharing cache, which left each link whose parent was reused by rule node with its
+own ComputedValues (22,687 of the 42,903 styles on the TC39 spec). Stylo walks
+breadth-first, so every other element at a depth passes through the cache between
+two cousins; 64 entries keep 2.8 MB fewer styles on the HTML spec and 1.5 MB on
+TC39 at no measurable CPU cost.
+---
+ invalidation/element/invalidation_map.rs | 12 ++++++++++++
+ sharing/mod.rs                           | 14 +++++++++-----
+ values/computed/length_percentage.rs     |  4 +++-
+ 3 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/invalidation/element/invalidation_map.rs b/invalidation/element/invalidation_map.rs
+index 498fe8d..bd83c38 100644
+--- a/invalidation/element/invalidation_map.rs
++++ b/invalidation/element/invalidation_map.rs
+@@ -399,6 +399,9 @@ pub struct AdditionalRelativeSelectorInvalidationMap {
+     pub used: bool,
+     /// Flag indicating if invalidating a relative selector requires ancestor traversal.
+     pub needs_ancestors_traversal: bool,
++    /// Flag indicating if any relative selector starts with a sibling combinator, so an
++    /// anchor can depend on an element inserted after it.
++    pub has_sibling_relative_selectors: bool,
+ }
+
+ impl Default for AdditionalRelativeSelectorInvalidationMap {
+@@ -416,6 +419,7 @@ impl AdditionalRelativeSelectorInvalidationMap {
+             any_to_selector: SmallVec::default(),
+             used: false,
+             needs_ancestors_traversal: false,
++            has_sibling_relative_selectors: false,
+         }
+     }
+
+@@ -1316,6 +1320,14 @@ impl<'a, 'b> RelativeSelectorDependencyCollector<'a, 'b> {
+             | RelativeSelectorMatchHint::InSubtree => true,
+             _ => false,
+         };
++        self.additional_relative_selector_invalidation_map
++            .has_sibling_relative_selectors |= match self.selector.match_hint {
++            RelativeSelectorMatchHint::InNextSibling
++            | RelativeSelectorMatchHint::InSibling
++            | RelativeSelectorMatchHint::InNextSiblingSubtree
++            | RelativeSelectorMatchHint::InSiblingSubtree => true,
++            RelativeSelectorMatchHint::InChild | RelativeSelectorMatchHint::InSubtree => false,
++        };
+         loop {
+             // Reset the compound state.
+             self.compound_state = PerCompoundState::new(index);
+diff --git a/sharing/mod.rs b/sharing/mod.rs
+index ef4c5f9..fc6d102 100644
+--- a/sharing/mod.rs
++++ b/sharing/mod.rs
+@@ -91,9 +91,10 @@ mod checks;
+ ///
+ /// The cache size was chosen by measuring style sharing and resulting performance on a few pages;
+ /// sizes up to about 32 were giving good sharing improvements (e.g. 3x fewer styles having to be
+-/// resolved than at size 8) and slight performance improvements.  Sizes larger than 32 haven't
+-/// really been tested.
+-pub const SHARING_CACHE_SIZE: usize = 32;
++/// resolved than at size 8) and slight performance improvements. On the HTML and TC39 specs, 64
++/// kept 2.8 and 1.5 MB fewer styles than 32 at no measurable cost; 128 kept 4.4 and 2.6 MB fewer
++/// but its longer linear scans made TC39 styling ~2% slower.
++pub const SHARING_CACHE_SIZE: usize = 64;
+
+ /// The max amount of DOM depths we keep around to share styles across. See bug 2052731.
+ const SHARING_MAX_LEVELS: usize = 8;
+@@ -960,8 +961,11 @@ impl<E: TElement> StyleSharingCache<E> {
+             // but at the end of the cascade (in `adjust_for_visited`) we do store the
+             // RELEVANT_LINK_VISITED flag, so we can't share by rule node between visited and
+             // unvisited styles. We don't check for visitedness and just refuse to share for links
+-            // entirely, so that visitedness doesn't affect timing.
+-            if target.is_link() || candidate.element.is_link() {
++            // entirely, so that visitedness doesn't affect timing. Without visited styles no
++            // link is styled as visited, so links share by rule node with other links.
++            if target.is_link() != candidate.element.is_link()
++                || (target.is_link() && shared_context.visited_styles_enabled)
++            {
+                 return None;
+             }
+
+diff --git a/values/computed/length_percentage.rs b/values/computed/length_percentage.rs
+index cc5b853..2b52955 100644
+--- a/values/computed/length_percentage.rs
++++ b/values/computed/length_percentage.rs
+@@ -571,7 +571,9 @@ pub type CalcNode = calc::GenericCalcNode<ComputedLeaf>;
+     ToCss,
+     ToTyped,
+ )]
+-#[repr(C)]
++// Taffy's CompactLength keeps a tag in the low three bits of a pointer to this, so it must be
++// 8-aligned on 32-bit targets too rather than relying on the allocator rounding up.
++#[repr(C, align(8))]
+ pub struct CalcLengthPercentage {
+     #[animation(constant)]
+     #[css(skip)]

@@ -1,32 +1,26 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bpereira <bpereira@cloudflare.com>
-Date: Sat, 24 Oct 2026 23:50:19 +0100
-Subject: [PATCH] Compact retained shaped text
+Date: Thu, 12 Nov 2026 22:09:59 +0000
+Subject: [PATCH] Compact retained shaped text and reuse the analysis buffer
 
-A shaped paragraph keeps one Character per source character and one
-ShapedCluster per cluster, so their size dominates retained text:
+Compact retained shaped text: shaped text buffers drop their growth slack once
+shaping is done, a cluster stores only the start of its characters, a character's
+grapheme start moves into its flags, glyph and variation coordinate buffers become
+thin vectors, and cluster and character positions come from a sparse index with a
+per-cluster fallback when a delta overflows. Range access and shaping output are
+unchanged.
 
-- Shaped text buffers drop their growth slack once shaping is done.
-- A cluster stores only the start of its characters; its end comes from
-  the next cluster or the shaped-text boundary.
-- A character's grapheme start is a bit in its flags (Character 12 -> 8
-  bytes on wasm32).
-- Glyph and variation coordinate buffers are thin vectors, since most
-  clusters have one inline glyph and most fonts no variations.
-- Cluster and character positions come from a sparse index: a u32 base
-  per 4096 clusters plus a u16 delta (ShapedCluster 16 -> 12 bytes,
-  Character 8 -> 4 bytes), falling back to one base per cluster if a
-  delta overflows.
-
-Range access and shaping output are unchanged.
-
-Signed-off-by: bpereira <bpereira@cloudflare.com>
+Reuse the line boundary buffer across analyses: the analyzer keeps the line
+boundary positions between calls instead of growing a fresh Vec for every
+paragraph.
 ---
  Cargo.toml               |   4 +
+ src/analysis.rs          |   6 +-
+ src/analyzer.rs          |   3 +
  src/shape/atom.rs        | 250 ++++++++++++++----------
  src/shape/data.rs        | 413 ++++++++++++++++++++++++++++++++++-----
  src/shape/shaped_text.rs | 146 ++++++++++----
- 4 files changed, 622 insertions(+), 191 deletions(-)
+ 6 files changed, 629 insertions(+), 193 deletions(-)
 
 diff --git a/Cargo.toml b/Cargo.toml
 index 041dd9d..82f700b 100644
@@ -43,6 +37,58 @@ index 041dd9d..82f700b 100644
  [dependencies.parley_data]
  version = "0.12.0"
  features = ["baked"]
+diff --git a/src/analysis.rs b/src/analysis.rs
+index 6a4df3e..630171f 100644
+--- a/src/analysis.rs
++++ b/src/analysis.rs
+@@ -551,7 +551,8 @@ pub(crate) fn analyze_text(
+     let contiguous_substrings = LineBreakSegmentIter::new(text, segments, first_segment);
+
+     let mut global_offset = 0;
+-    let mut line_boundary_positions: Vec<usize> = Vec::new();
++    let mut line_boundary_positions = core::mem::take(&mut analyzer.line_boundaries);
++    line_boundary_positions.clear();
+
+     let data_sources = AnalysisDataSources::new();
+
+@@ -807,6 +808,7 @@ pub(crate) fn analyze_text(
+             properties.is_emoji_modifier_base(),
+         ));
+     }
++    analyzer.line_boundaries = line_boundary_positions;
+
+     // `unicode-bidi: plaintext` re-runs first-strong per
+     // paragraph; only text that needs bidi resolution at all does.
+@@ -838,7 +840,7 @@ pub(crate) fn analyze_text(
+ // resolver) resolves on the scratch resolver and splices back.
+ fn resolve_per_paragraph(analyzer: &mut Analyzer, text: &str, data_sources: &AnalysisDataSources) {
+     use icu_properties::props::BidiClass;
+-    let Analyzer { bidi, bidi_scratch } = analyzer;
++    let Analyzer { bidi, bidi_scratch, .. } = analyzer;
+     bidi.clear();
+     let classify = |ch: char| {
+         let bidi_class = data_sources.properties(ch).bidi_class();
+diff --git a/src/analyzer.rs b/src/analyzer.rs
+index d3b9ba0..e619369 100644
+--- a/src/analyzer.rs
++++ b/src/analyzer.rs
+@@ -3,6 +3,7 @@
+
+ //! The analyzer API.
+
++use alloc::vec::Vec;
+ use core::ops::Range;
+
+ use parlance::{BaseDirection, Language, LineBreak, WordBreak};
+@@ -18,6 +19,8 @@ pub struct Analyzer {
+     // Scratch resolver for `auto_per_paragraph`. It resolves
+     // one paragraph at a time, and the result is spliced back into `bidi`.
+     pub(crate) bidi_scratch: BidiResolver,
++    /// Line boundary positions, kept so each analysis reuses the buffer.
++    pub(crate) line_boundaries: Vec<usize>,
+ }
+
+ impl core::fmt::Debug for Analyzer {
 diff --git a/src/shape/atom.rs b/src/shape/atom.rs
 index fda89d7..699eef1 100644
 --- a/src/shape/atom.rs

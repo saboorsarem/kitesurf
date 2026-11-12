@@ -1,25 +1,36 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: bpereira <bpereira@cloudflare.com>
-Date: Sun, 25 Oct 2026 01:08:05 +0000
-Subject: [PATCH] Read compact DOM storage through accessors
+Date: Thu, 12 Nov 2026 22:06:17 +0000
+Subject: [PATCH] Paint optional decorations and read compact DOM storage
+ through accessors
 
-blitz-dom moved rarely used element data out of line. Read its sidecars,
-element image layers, list-item data and inline text layouts through the
-ElementData accessors. Paint output is unchanged.
+Paint optional text style decorations: parley now boxes laid-out underline and
+strikethrough decorations and leaves them out for runs that have none, so paint
+them only when present.
 
-Signed-off-by: bpereira <bpereira@cloudflare.com>
+Read compact DOM storage through accessors: blitz-dom moved rarely used element
+data out of line, so read its sidecars, element image layers, list-item data and
+inline text layouts through the ElementData accessors. Paint output is unchanged.
+
+Read inline layouts through the rebuilding accessor: blitz-dom evicts the shaped
+text of inline roots far from the viewport, so paint reads a root's layout through
+the accessor that rebuilds an evicted one instead of reading an empty layout.
+
+Read box child lists through node accessors, since blitz-dom keeps layout and paint
+child lists only on box nodes.
 ---
- src/render.rs            | 22 ++++++++++------------
- src/render/background.rs |  4 ++--
- src/render/mask.rs       |  2 +-
- src/text.rs              |  6 +++---
- 4 files changed, 16 insertions(+), 18 deletions(-)
+ src/render.rs               | 44 +++++++++++++++++++------------------
+ src/render/background.rs    |  4 ++--
+ src/render/mask.rs          |  2 +-
+ src/text.rs                 |  6 ++---
+ src/text_box_decorations.rs |  8 +++++--
+ 5 files changed, 35 insertions(+), 29 deletions(-)
 
 diff --git a/src/render.rs b/src/render.rs
-index 83348ff..5a5baba 100644
+index d961a32..dcf399a 100644
 --- a/src/render.rs
 +++ b/src/render.rs
-@@ -404,14 +404,14 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
+@@ -466,14 +466,14 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
          let overflow = *node.scrollable_overflow();
          let transform = parent_style_transform
              * Affine::translate(box_position)
@@ -36,7 +47,7 @@ index 83348ff..5a5baba 100644
              Some((x0, y0, x1, y1)) => {
                  let reach = Rect::new(
                      x0 as f64 * self.scale,
-@@ -459,7 +459,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
+@@ -521,7 +521,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
          if should_clip
              && clip_area < 0.01
              && overflow_area < 0.01
@@ -45,7 +56,7 @@ index 83348ff..5a5baba 100644
          {
              return;
          }
-@@ -769,7 +769,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
+@@ -831,7 +831,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                  _ => None,
              },
              text_input: element.text_input_data(),
@@ -54,7 +65,7 @@ index 83348ff..5a5baba 100644
              devtools: self.dom.devtools(),
              custom_widget_scene,
          }
-@@ -995,8 +995,7 @@ impl ElementCx<'_, '_> {
+@@ -1057,8 +1057,7 @@ impl ElementCx<'_, '_> {
      fn draw_inline_layout(&self, scene: &mut impl PaintScene, pos: Point) {
          if self.node.flags.is_inline_root() {
              let text_layout = self.element
@@ -64,17 +75,64 @@ index 83348ff..5a5baba 100644
                  .unwrap_or_else(|| {
                      panic!("Tried to render node marked as inline root that does not have an inline layout: {:?}", self.node);
                  });
-@@ -1142,8 +1141,7 @@ impl ElementCx<'_, '_> {
+@@ -1067,12 +1066,13 @@ impl ElementCx<'_, '_> {
+                 x: pos.x,
+                 y: pos.y + text_layout.block_offset as f64,
+             };
++            let layout = text_layout.layout(self.context.dom.tree());
+             let transform =
+                 self.transform * Affine::translate((pos.x * self.scale, pos.y * self.scale));
+
+             crate::text_box_decorations::paint_span_fragment_backgrounds(
+                 scene,
+-                &text_layout.layout,
++                layout,
+                 self.context.dom,
+                 transform,
+                 self.node.id,
+@@ -1082,7 +1082,7 @@ impl ElementCx<'_, '_> {
+             if let Some(&(sel_start, sel_end)) = self.context.selection_ranges.get(&self.node.id) {
+                 crate::text::draw_text_selection(
+                     scene,
+-                    &text_layout.layout,
++                    layout,
+                     transform,
+                     sel_start,
+                     sel_end,
+@@ -1093,7 +1093,7 @@ impl ElementCx<'_, '_> {
+             let mut draw_text_context = self.context.draw_text_context.borrow_mut();
+             crate::text::stroke_text(
+                 scene,
+-                text_layout.layout.lines(),
++                layout.lines(),
+                 self.context.dom,
+                 transform,
+                 self.scale,
+@@ -1104,7 +1104,7 @@ impl ElementCx<'_, '_> {
+
+             crate::text_box_decorations::paint_span_fragment_borders(
+                 scene,
+-                &text_layout.layout,
++                layout,
+                 self.context.dom,
+                 transform,
+                 self.node.id,
+@@ -1204,9 +1204,11 @@ impl ElementCx<'_, '_> {
              // Align the marker with the baseline of the first line of text in the list item
              let y_offset = if let Some((text_layout, first_text_line)) = &self
                  .element
 -                .inline_layout_data
 -                .as_ref()
+-                .and_then(|text_layout| Some((text_layout, text_layout.layout.lines().next()?)))
 +                .inline_layout_data()
-                 .and_then(|text_layout| Some((text_layout, text_layout.layout.lines().next()?)))
++                .and_then(|text_layout| {
++                    let layout = text_layout.layout(self.context.dom.tree());
++                    Some((text_layout, layout.lines().next()?))
++                })
              {
                  (first_text_line.metrics().baseline
-@@ -1185,7 +1183,7 @@ impl ElementCx<'_, '_> {
+                     - layout.lines().next().unwrap().metrics().baseline)
+@@ -1247,7 +1249,7 @@ impl ElementCx<'_, '_> {
      ) {
          // Negative z_index hoisted nodes
 
@@ -83,16 +141,21 @@ index 83348ff..5a5baba 100644
              for hoisted_child in hoisted.neg_z_hoisted_children() {
                  let position = hoisted_child.position(self.node.tree(), self.node.id);
                  self.render_hoisted_child(
-@@ -1202,7 +1200,7 @@ impl ElementCx<'_, '_> {
-         if let Some(children) = &*self.node.paint_children.borrow() {
-             for child_id in children {
+@@ -1261,10 +1263,10 @@ impl ElementCx<'_, '_> {
+         }
+
+         // Regular children
+-        if let Some(children) = &*self.node.paint_children.borrow() {
+-            for child_id in children {
++        if let Some(children) = self.node.paint_children() {
++            for child_id in children.iter() {
                  let child = &self.context.dom.as_ref().tree()[*child_id];
 -                let child_transform = match child.paint_parent_override.get() {
 +                let child_transform = match child.paint_parent_override() {
                      Some(parent) if parent == self.node.id => {
                          if skip_rehomed {
                              continue;
-@@ -1235,7 +1233,7 @@ impl ElementCx<'_, '_> {
+@@ -1297,7 +1299,7 @@ impl ElementCx<'_, '_> {
          }
 
          // Positive z_index hoisted nodes
@@ -101,9 +164,16 @@ index 83348ff..5a5baba 100644
              for hoisted_child in hoisted.pos_z_hoisted_children() {
                  let position = hoisted_child.position(self.node.tree(), self.node.id);
                  self.render_hoisted_child(
-@@ -1365,7 +1363,7 @@ impl ElementCx<'_, '_> {
+@@ -1422,12 +1424,12 @@ impl ElementCx<'_, '_> {
+         parent_style_transform: Affine,
+         clip_rect: Rect,
+     ) {
+-        let Some(children) = &*self.node.paint_children.borrow() else {
++        let Some(children) = self.node.paint_children() else {
+             return;
          };
-         for child_id in children {
+-        for child_id in children {
++        for child_id in children.iter() {
              let child = &self.context.dom.as_ref().tree()[*child_id];
 -            if child.paint_parent_override.get() != Some(self.node.id) {
 +            if child.paint_parent_override() != Some(self.node.id) {
@@ -111,7 +181,7 @@ index 83348ff..5a5baba 100644
              }
              let translation = child.rehomed_paint_translate(self.node.id);
 diff --git a/src/render/background.rs b/src/render/background.rs
-index 6f9ce97..b02bc1d 100644
+index a315c2c..cf4fd25 100644
 --- a/src/render/background.rs
 +++ b/src/render/background.rs
 @@ -138,7 +138,7 @@ impl<'a> ImageLayerStyles<'a> {
@@ -176,3 +246,29 @@ index c0762dd..5fe4157 100644
                  }
                  path_scratch.extend(ancestors.iter().copied());
                  path_scratch.reverse();
+diff --git a/src/text_box_decorations.rs b/src/text_box_decorations.rs
+index ef02026..800fc93 100644
+--- a/src/text_box_decorations.rs
++++ b/src/text_box_decorations.rs
+@@ -64,7 +64,9 @@ pub(crate) fn paint_span_fragment_backgrounds(
+             Some(s) => s,
+             None => continue,
+         };
+-        let decos = &style.box_decorations;
++        let Some(decos) = style.box_decorations.as_deref() else {
++            continue;
++        };
+         if decos.is_empty() {
+             // Defensive: if a fragment was emitted with empty
+             // decorations, there's nothing to paint. The line
+@@ -138,7 +140,9 @@ pub(crate) fn paint_span_fragment_borders(
+             Some(s) => s,
+             None => continue,
+         };
+-        let decos = &style.box_decorations;
++        let Some(decos) = style.box_decorations.as_deref() else {
++            continue;
++        };
+         let top_w = decos.border_block_start_width as f64;
+         let right_w = decos.border_inline_end_width as f64;
+         let bottom_w = decos.border_block_end_width as f64;

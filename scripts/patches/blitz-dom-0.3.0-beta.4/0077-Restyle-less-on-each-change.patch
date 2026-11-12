@@ -1,0 +1,650 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: bpereira <bpereira@cloudflare.com>
+Date: Thu, 12 Nov 2026 22:05:40 +0000
+Subject: [PATCH] Restyle less on each change
+
+Add a style-only resolve for computed-value readers: resolve_style runs the inputs
+the cascade needs and the stylist and leaves restyle damage on the nodes for the
+next full resolve, reporting false when a query container exists because @container
+rules cascade against laid-out sizes. Whether a query container exists is a sticky
+flag that the style traversal and the full-resolve container snapshot set.
+
+Restyle only structurally affected siblings on child insertion: like Gecko's
+RestyleForInsertOrChange, restyle the inserted children and use the parent's
+selector flags to restyle only the edge children or later siblings that structural
+selectors can match. :empty, from-end selectors, sibling-index(), slots and shadow
+hosts keep the whole-parent restyle, and :has() keeps its own invalidator.
+
+Cache parsed query selectors and hint sibling indexes: a small thread-local hint
+per parent slot, always checked against the list, makes in-order sibling steps
+constant time without growing Node.
+
+Reshape only text that names a newly registered web font family, and the inline
+roots above it, since only that text can shape differently; a face with no family
+name still reshapes everything. The damage is applied at the next resolve rather
+than on each delivery, so a page that receives N faces walks its nodes once instead
+of N times.
+---
+ src/document.rs       | 36 +++++++++++++++++--
+ src/layout/damage.rs  | 83 ++++++++++++++++++++++++++++++++++++++++++
+ src/mutator.rs        | 84 +++++++++++++++++++++++++++++++++++++++----
+ src/node/node.rs      | 25 ++++++++++---
+ src/query_selector.rs | 51 +++++++++++++++++++++++++-
+ src/resolve.rs        | 30 ++++++++++++++++
+ src/stylo.rs          | 79 +++++++++++++++++++++++++++++-----------
+ src/url.rs            |  4 +++
+ 8 files changed, 358 insertions(+), 34 deletions(-)
+
+diff --git a/src/document.rs b/src/document.rs
+index 5f57b00..8d4090d 100644
+--- a/src/document.rs
++++ b/src/document.rs
+@@ -301,6 +301,17 @@ pub struct BaseDocument {
+     // Config
+     /// Base url for resolving linked resources (stylesheets, images, fonts, etc)
+     pub(crate) url: DocumentUrl,
++    /// querySelector-family selectors already parsed against `url`.
++    pub(crate) selector_cache: crate::query_selector::SelectorCache,
++    /// Sticky: some element was ever styled as a query container, so a style-only resolve can
++    /// no longer skip layout. Saves `resolve_style` a scan of every node on each read.
++    pub(crate) size_container_seen: bool,
++    /// A web font arrived since the last resolve, so inline contexts must be reshaped.
++    pub(crate) inline_contexts_stale: bool,
++    /// Lowercased families of the faces registered since the last resolve. Only text whose
++    /// `font-family` names one of them can shape differently, unless a face had no name.
++    pub(crate) stale_font_families: Vec<String>,
++    pub(crate) stale_font_family_unknown: bool,
+     // Devtool settings. Currently used to render debug overlays
+     pub(crate) devtool_settings: DevtoolSettings,
+     // Viewport details such as the dimensions, HiDPI scale, and zoom factor,
+@@ -708,6 +719,11 @@ impl BaseDocument {
+             counters_seen: false,
+             counters_built_once: false,
+             url: base_url,
++            selector_cache: Default::default(),
++            size_container_seen: false,
++            inline_contexts_stale: false,
++            stale_font_families: Vec::new(),
++            stale_font_family_unknown: false,
+             author_sheet_cache: HashMap::new(),
+             pending_style_nodes: HashSet::new(),
+             author_sheet_keys: HashMap::new(),
+@@ -2429,6 +2445,21 @@ impl BaseDocument {
+                         });
+                     }
+                 }
++                let mut names: Vec<String> =
++                    overrides.family_name.iter().map(|name| name.to_lowercase()).collect();
++                for (family, _) in &registered {
++                    if let Some(name) = global_font_ctx.collection.family_name(*family) {
++                        names.push(name.to_lowercase());
++                    }
++                }
++                let mut named = false;
++                for name in names {
++                    named = true;
++                    if !self.stale_font_families.contains(&name) {
++                        self.stale_font_families.push(name);
++                    }
++                }
++                self.stale_font_family_unknown |= !named;
+
+                 #[cfg(feature = "parallel-construct")]
+                 {
+@@ -2444,8 +2475,9 @@ impl BaseDocument {
+                 }
+                 drop(global_font_ctx);
+
+-                // TODO: see if we can only invalidate if resolved fonts may have changed
+-                self.invalidate_inline_contexts();
++                // Deferred to the next resolve: the damage is only read there, and a page
++                // receiving N faces would otherwise walk every node N times.
++                self.inline_contexts_stale = true;
+             }
+             Resource::None => {
+                 // Do nothing
+diff --git a/src/layout/damage.rs b/src/layout/damage.rs
+index eb33360..9cf944d 100644
+--- a/src/layout/damage.rs
++++ b/src/layout/damage.rs
+@@ -604,6 +604,89 @@ pub(crate) fn sort_layout_children_by_order(
+ }
+
+ impl BaseDocument {
++    /// `invalidate_inline_contexts` limited to text that can shape differently now that faces of
++    /// `families` (lowercased) exist: nodes whose `font-family` names one of them. Each match
++    /// damages the inline root holding its text and every inline root above it, since an
++    /// inline-block that reshapes resizes the lines around it.
++    pub(crate) fn invalidate_inline_contexts_using(&mut self, families: &[String]) {
++        if families.is_empty() {
++            return;
++        }
++        let names_family = |node: &Node| {
++            let Some(styles) = node.primary_styles() else {
++                // Unstyled boxes keep no record of their font; reshape them to be safe.
++                return node.element_data().is_some_and(|e| e.inline_layout_data().is_some());
++            };
++            styles.get_font().font_family.families.list.iter().any(|family| match family {
++                style::values::computed::font::SingleFontFamily::FamilyName(name) => {
++                    let name: &str = name.name.as_ref();
++                    families.iter().any(|f| {
++                        if name.is_ascii() {
++                            f.eq_ignore_ascii_case(name)
++                        } else {
++                            f.as_str() == name.to_lowercase().as_str()
++                        }
++                    })
++                }
++                style::values::computed::font::SingleFontFamily::Generic(_) => false,
++            })
++        };
++        let matched: Vec<NodeId> = self
++            .nodes
++            .iter()
++            .filter(|(_, node)| node.flags.contains(NodeFlags::IS_IN_DOCUMENT))
++            .filter(|(_, node)| node.element_data().is_some() && names_family(node))
++            .map(|(id, _)| id)
++            .collect();
++        if matched.is_empty() {
++            return;
++        }
++
++        let scale = self.viewport.scale();
++        let mut visited = std::collections::HashSet::new();
++        let mut roots = Vec::new();
++        let mut inputs = Vec::new();
++        for start in matched {
++            if self.nodes[start].element_data().is_some_and(|e| e.text_input_data().is_some()) {
++                inputs.push(start);
++            }
++            let mut at = Some(start);
++            while let Some(id) = at {
++                if !visited.insert(id) {
++                    break;
++                }
++                let node = &self.nodes[id];
++                if node.element_data().is_some_and(|e| e.inline_layout_data().is_some()) {
++                    roots.push(id);
++                }
++                at = node.layout_parent.get().or(node.parent.get());
++            }
++        }
++
++        for id in roots {
++            let node = &mut self.nodes[id];
++            node.insert_damage(ALL_DAMAGE);
++            if node.is_anonymous() {
++                if let Some(parent_id) = node.layout_parent.get() {
++                    self.nodes[parent_id].insert_damage(ALL_DAMAGE);
++                }
++            }
++        }
++        let font_ctx = &self.font_ctx;
++        let layout_ctx = &mut self.layout_ctx;
++        for id in inputs {
++            let node = &mut self.nodes[id];
++            if let Some(input) =
++                node.data.downcast_element_mut().and_then(|e| e.text_input_data_mut())
++            {
++                input.editor.set_scale(scale);
++                let mut font_ctx = font_ctx.lock().unwrap();
++                input.editor.refresh_layout(&mut font_ctx, layout_ctx);
++                node.insert_damage(ONLY_RELAYOUT);
++            }
++        }
++    }
++
+     pub(crate) fn invalidate_inline_contexts(&mut self) {
+         let scale = self.viewport.scale();
+
+diff --git a/src/mutator.rs b/src/mutator.rs
+index a85e9ab..3f042ee 100644
+--- a/src/mutator.rs
++++ b/src/mutator.rs
+@@ -20,6 +20,23 @@ use thin_vec::ThinVec;
+
+ const TEMPLATE_CONTENTS_FRAGMENT_NAME: &str = "#document-fragment";
+
++/// Whether inserting a child must recascade the parent's whole subtree: its own `:empty`, a
++/// `:last-child`-style or `sibling-index()` dependency on every child, or a flat tree that
++/// slotting reshapes. Anything else goes through `restyle_for_insertion`.
++fn insertion_restyles_whole_parent(parent: &Node) -> bool {
++    use selectors::matching::ElementSelectorFlags;
++
++    if !parent.is_element() || parent.is_slot_element() || parent.attached_shadow_root_id().is_some()
++    {
++        return true;
++    }
++    parent.selector_flags().get().intersects(
++        ElementSelectorFlags::HAS_EMPTY_SELECTOR
++            | ElementSelectorFlags::HAS_SLOW_SELECTOR
++            | ElementSelectorFlags::MAY_HAVE_TREE_COUNTING_FUNCTION,
++    )
++}
++
+ macro_rules! tag_and_attr {
+     ($tag:tt, $attr:tt) => {
+         (&local_name!($tag), &local_name!($attr))
+@@ -981,16 +998,21 @@ impl DocumentMutator<'_> {
+             self.maybe_record_node(old_parent_id);
+         }
+
++        let has_sibling_relative_selectors =
++            new_parent_is_in_document && self.doc.has_sibling_relative_selectors();
+         let new_parent = &mut self.doc.nodes[parent_id];
+         new_parent.insert_damage(ALL_DAMAGE);
+
+-        // TODO: make this fine grained / conditional based on ElementSelectorFlags
++        let restyle_whole_parent = new_parent_is_in_document
++            && (insertion_restyles_whole_parent(new_parent) || has_sibling_relative_selectors);
+         if new_parent_is_in_document {
+-            if let Some(mut data) = new_parent
+-                .try_stylo_element_data_mut()
+-                .and_then(|s| s.get_mut())
+-            {
+-                data.hint |= RestyleHint::restyle_subtree();
++            if restyle_whole_parent {
++                if let Some(mut data) = new_parent
++                    .try_stylo_element_data_mut()
++                    .and_then(|s| s.get_mut())
++                {
++                    data.hint |= RestyleHint::restyle_subtree();
++                }
+             }
+             new_parent.set_dirty_descendants();
+             // Mark ancestors dirty so the style traversal visits this subtree.
+@@ -1017,6 +1039,9 @@ impl DocumentMutator<'_> {
+         // Insertions invalidate after linking, since the collector
+         // reads the node's final parent and sibling positions.
+         if new_parent_is_in_document {
++            if !restyle_whole_parent {
++                self.restyle_for_insertion(parent_id, child_ids);
++            }
+             for &child_id in child_ids.iter() {
+                 self.doc.invalidate_relative_selectors_for_insertion(child_id);
+             }
+@@ -1025,6 +1050,53 @@ impl DocumentMutator<'_> {
+         self.maybe_record_node(parent_id);
+     }
+
++    /// Gecko's RestyleForInsertOrChange: restyle the inserted children, plus the siblings whose
++    /// structural selectors (`:first-child`, `+`, `~`, `:nth-child`) the parent's selector flags
++    /// say could change. Inherited styles cannot change, so the rest of the parent is untouched.
++    fn restyle_for_insertion(&mut self, parent_id: NodeId, child_ids: &[NodeId]) {
++        use selectors::matching::ElementSelectorFlags;
++
++        for &child_id in child_ids {
++            self.doc.nodes[child_id].set_restyle_hint(RestyleHint::restyle_subtree());
++        }
++        let flags = self.doc.nodes[parent_id].selector_flags().get();
++        let later_siblings = flags.contains(ElementSelectorFlags::HAS_SLOW_SELECTOR_LATER_SIBLINGS);
++        let edge_children = flags.contains(ElementSelectorFlags::HAS_EDGE_CHILD_SELECTOR);
++        if !later_siblings && !edge_children {
++            return;
++        }
++        let (Some(&first_id), Some(&last_id)) = (child_ids.first(), child_ids.last()) else {
++            return;
++        };
++        let children = &self.doc.nodes[parent_id].children;
++        // Callers splice `child_ids` in as one contiguous run; anything else restyles it all.
++        let first = if children.last() == Some(&last_id) {
++            children.len().checked_sub(child_ids.len())
++        } else {
++            children.iter().position(|id| *id == first_id)
++        };
++        let first = first.filter(|&f| children.get(f) == Some(&first_id));
++        let last = first.map(|first| first + child_ids.len() - 1);
++        let (Some(first), Some(last)) = (first, last.filter(|&l| children.get(l) == Some(&last_id)))
++        else {
++            self.doc.nodes[parent_id].set_restyle_hint(RestyleHint::restyle_subtree());
++            return;
++        };
++        let is_element = |id: &&NodeId| self.doc.nodes[**id].is_element();
++        let mut targets: Vec<NodeId> = Vec::new();
++        if edge_children {
++            // The old first or last element child, or the old only child.
++            targets.extend(children[..first].iter().rev().find(is_element));
++            targets.extend(children[last + 1..].iter().find(is_element));
++        }
++        if later_siblings {
++            targets.extend(children[last + 1..].iter().filter(is_element));
++        }
++        for id in targets {
++            self.doc.nodes[id].set_restyle_hint(RestyleHint::restyle_subtree());
++        }
++    }
++
+     // Tree mutation methods (that defer to other methods)
+     pub fn insert_nodes_after(&mut self, anchor_node_id: NodeId, new_node_ids: &[NodeId]) {
+         match self.next_sibling_id(anchor_node_id) {
+diff --git a/src/node/node.rs b/src/node/node.rs
+index fd4891b..2f3cda0 100644
+--- a/src/node/node.rs
++++ b/src/node/node.rs
+@@ -379,6 +379,15 @@ pub(crate) struct LayoutChildLists {
+     paint: RefCell<Option<ThinVec<NodeId>>>,
+ }
+
++/// Parents tracked at once by `child_index`; a tree walk keeps one slot per open ancestor.
++const CHILD_INDEX_HINTS: usize = 64;
++
++thread_local! {
++    /// Last child index found under each parent slot. Storing it in `Node` would grow every node.
++    static CHILD_INDEX_HINT: [Cell<usize>; CHILD_INDEX_HINTS] =
++        const { [const { Cell::new(0) }; CHILD_INDEX_HINTS] };
++}
++
+ pub struct Node {
+     // The actual tree we belong to. This is unsafe!!
+     tree: *mut crate::NodeTree,
+@@ -1605,10 +1614,18 @@ impl Node {
+
+     // Get the index of the current node in the parents child list
+     pub fn child_index(&self) -> Option<usize> {
+-        self.tree()[self.parent.get()?]
+-            .children
+-            .iter()
+-            .position(|id| *id == self.id)
++        let parent_id = self.parent.get()?;
++        let siblings = &self.tree()[parent_id].children;
++        let slot = parent_id.as_u64() as usize % CHILD_INDEX_HINTS;
++        let hint = CHILD_INDEX_HINT.with(|hints| hints[slot].get());
++        // Walks visit siblings in order, so the last index seen under this parent (or its
++        // neighbour) is usually ours. Any hint is checked against the list before use.
++        let found = [hint.wrapping_add(1), hint, hint.wrapping_sub(1)]
++            .into_iter()
++            .find(|&index| siblings.get(index) == Some(&self.id))
++            .or_else(|| siblings.iter().position(|id| *id == self.id))?;
++        CHILD_INDEX_HINT.with(|hints| hints[slot].set(found));
++        Some(found)
+     }
+
+     // Get the nth node in the parents child list
+diff --git a/src/query_selector.rs b/src/query_selector.rs
+index a721eb4..aa38612 100644
+--- a/src/query_selector.rs
++++ b/src/query_selector.rs
+@@ -1,5 +1,6 @@
+ use blitz_traits::node_id::NodeId;
+ use selectors::SelectorList;
++use std::collections::HashMap;
+ use smallvec::SmallVec;
+ use style::dom::{TDocument, TNode};
+ use style::dom_apis::{
+@@ -8,8 +9,51 @@ use style::dom_apis::{
+ use style::selector_parser::{SelectorImpl, SelectorParser};
+ use style_traits::ParseError;
+
++use crate::url::DocumentUrl;
+ use crate::{Atom, BaseDocument, Node};
+
++/// Distinct selectors kept per document; a full cache starts over, so a page generating
++/// endless unique selectors costs one reparse each and stays bounded.
++const SELECTOR_CACHE_ENTRIES: usize = 128;
++/// Longer selectors are rare and not worth retaining.
++const SELECTOR_CACHE_MAX_LEN: usize = 256;
++
++/// Parsed querySelector selectors by source text. Scripts query the same few selectors in
++/// loops, and parsing dominated short queries. Errors are not cached, so they reparse.
++#[derive(Default)]
++pub(crate) struct SelectorCache {
++    entries: std::cell::RefCell<Option<(DocumentUrl, ParsedSelectors)>>,
++}
++
++type ParsedSelectors = HashMap<Box<str>, SelectorList<SelectorImpl>>;
++
++impl SelectorCache {
++    fn get(&self, url: &DocumentUrl, input: &str) -> Option<SelectorList<SelectorImpl>> {
++        let entries = self.entries.borrow();
++        let (cached_url, lists) = entries.as_ref()?;
++        if !cached_url.same_url(url) {
++            return None;
++        }
++        lists.get(input).cloned()
++    }
++
++    fn insert(&self, url: &DocumentUrl, input: &str, list: &SelectorList<SelectorImpl>) {
++        if input.len() > SELECTOR_CACHE_MAX_LEN {
++            return;
++        }
++        let mut entries = self.entries.borrow_mut();
++        let stale = entries.as_ref().is_none_or(|(cached_url, lists)| {
++            !cached_url.same_url(url) || lists.len() >= SELECTOR_CACHE_ENTRIES
++        });
++        if stale {
++            *entries = Some((url.clone(), HashMap::new()));
++        }
++        if let Some((_, lists)) = entries.as_mut() {
++            lists.insert(input.into(), list.clone());
++        }
++    }
++}
++
+ impl BaseDocument {
+     /// Find the node with the specified id attribute (if one exists).
+     /// If multiple nodes have the same id, the first in tree order is returned.
+@@ -247,8 +291,13 @@ impl BaseDocument {
+         &self,
+         input: &str,
+     ) -> Result<SelectorList<SelectorImpl>, ParseError> {
++        if let Some(list) = self.selector_cache.get(&self.url, input) {
++            return Ok(list);
++        }
+         let url_extra_data = self.url.url_extra_data();
+-        SelectorParser::parse_author_origin_no_namespace(input, &url_extra_data)
++        let list = SelectorParser::parse_author_origin_no_namespace(input, &url_extra_data)?;
++        self.selector_cache.insert(&self.url, input, &list);
++        Ok(list)
+     }
+
+     // Namespace-aware variant for CSSOM selectorText writes: a rule in a
+diff --git a/src/resolve.rs b/src/resolve.rs
+index a7c33ff..c4a0628 100644
+--- a/src/resolve.rs
++++ b/src/resolve.rs
+@@ -129,6 +129,27 @@ impl BaseDocument {
+         }
+     }
+
++    /// Restyle the tree without box construction or layout, leaving damage for the next `resolve`.
++    /// False means the caller must still run `resolve`: no DOM, render-blocking resources are
++    /// pending, or a query container exists, since `@container` rules read laid-out sizes.
++    pub fn resolve_style(&mut self, current_time_for_animations: f64) -> bool {
++        if TDocument::as_node(&self.root_node())
++            .first_element_child()
++            .is_none()
++        {
++            return false;
++        }
++        self.process_pending_style_elements();
++        self.handle_messages();
++        if self.has_pending_critical_resources() {
++            return false;
++        }
++        self.flush_pending_device_changes();
++        self.flush_slot_assignments();
++        self.resolve_stylist(current_time_for_animations);
++        !self.size_container_seen
++    }
++
+     /// Restyle the tree and then relayout it
+     pub fn resolve(&mut self, current_time_for_animations: f64) {
+         if TDocument::as_node(&self.root_node())
+@@ -174,6 +195,14 @@ impl BaseDocument {
+         // Apply any device changes (viewport resize, zoom, color-scheme, etc)
+         // accumulated since the last resolve as a single device rebuild.
+         self.flush_pending_device_changes();
++        if std::mem::take(&mut self.inline_contexts_stale) {
++            let families = std::mem::take(&mut self.stale_font_families);
++            if std::mem::take(&mut self.stale_font_family_unknown) {
++                self.invalidate_inline_contexts();
++            } else {
++                self.invalidate_inline_contexts_using(&families);
++            }
++        }
+         // Slot assignment shapes the flat tree that styling and box
+         // construction both consume; recompute before either runs.
+         self.flush_slot_assignments();
+@@ -202,6 +231,7 @@ impl BaseDocument {
+         // Snapshot the sizes it styles against, so the pass after layout can
+         // spot the containers whose answer is now stale.
+         let container_sizes_before = container_sizes(self);
++        self.size_container_seen |= !container_sizes_before.is_empty();
+
+         // CSS counters: list-item values + counter()/attr() pseudo content.
+         // Needs computed styles; box construction consumes the side tables.
+diff --git a/src/stylo.rs b/src/stylo.rs
+index 58b53cd..5f3103f 100644
+--- a/src/stylo.rs
++++ b/src/stylo.rs
+@@ -5,7 +5,7 @@ use blitz_traits::node_id::NodeId;
+ use std::marker::PhantomData;
+ use std::ptr::NonNull;
+ use std::sync::Mutex;
+-use std::sync::atomic::Ordering;
++use std::sync::atomic::{AtomicBool, Ordering};
+
+ use crate::StyleThreading;
+ use crate::layout::damage::{CONSTRUCT_BOX, compute_layout_damage};
+@@ -189,6 +189,7 @@ impl crate::document::BaseDocument {
+             style::driver::traverse_dom(&traverser, token, rayon_pool);
+             nodes_needing_style_image_flush =
+                 std::mem::take(traverser.nodes_needing_style_image_flush.get_mut().unwrap());
++            self.size_container_seen |= *traverser.saw_size_container.get_mut();
+         }
+         self.pending_style_image_nodes
+             .extend(nodes_needing_style_image_flush);
+@@ -389,6 +390,26 @@ impl crate::document::BaseDocument {
+                 .any(|(data, _)| data.relative_invalidation_map_attributes().used)
+     }
+
++    /// Whether some `:has()` starts with `+` or `~`, in the document or any shadow tree, so
++    /// an inserted element can change an earlier sibling's match. An inserted element only
++    /// inherits its parent's search direction, which never carries the sibling one, so the
++    /// invalidator misses those anchors and the insertion must restyle the whole parent.
++    pub(crate) fn has_sibling_relative_selectors(&self) -> bool {
++        let reaches_siblings = |data: &style::stylist::CascadeData| {
++            data.relative_invalidation_map_attributes()
++                .has_sibling_relative_selectors
++        };
++        self.stylist
++            .iter_origins()
++            .any(|(data, _)| reaches_siblings(data))
++            || self.shadow_roots.iter().any(|&id| {
++                self.nodes
++                    .get(id)
++                    .and_then(|node| node.shadow_root_data())
++                    .is_some_and(|data| reaches_siblings(&data.author_styles.data))
++            })
++    }
++
+     /// Structural sibling of the pass above, for tree mutations rather than
+     /// attribute and state ones. Snapshots only exist for the latter, so an
+     /// insert or remove has to invalidate at mutation time.
+@@ -649,30 +670,28 @@ impl selectors::Element for BlitzNode<'_> {
+         matches!(self.data, NodeData::AnonymousBlock(_))
+     }
+
+-    // These methods are implemented naively since we only threaded real nodes and not fake nodes
+-    // we should try and use `find` instead of this foward/backward stuff since its ugly and slow
++    // Locate self in the parent's child list once, then scan from there: stepping with
++    // forward(n)/backward(n) repeated that lookup for every skipped text node.
+     fn prev_sibling_element(&self) -> Option<Self> {
+-        let mut n = 1;
+-        while let Some(node) = self.backward(n) {
+-            if node.is_element() {
+-                return Some(node);
+-            }
+-            n += 1;
+-        }
+-
+-        None
++        let parent = self.with(self.parent.get()?);
++        let index = self.child_index().unwrap_or(0);
++        parent.children[..index]
++            .iter()
++            .rev()
++            .map(|id| self.with(*id))
++            .find(|node| node.is_element())
+     }
+
+     fn next_sibling_element(&self) -> Option<Self> {
+-        let mut n = 1;
+-        while let Some(node) = self.forward(n) {
+-            if node.is_element() {
+-                return Some(node);
+-            }
+-            n += 1;
+-        }
+-
+-        None
++        let parent = self.with(self.parent.get()?);
++        let index = self.child_index().unwrap_or(0);
++        parent
++            .children
++            .get(index + 1..)
++            .unwrap_or_default()
++            .iter()
++            .map(|id| self.with(*id))
++            .find(|node| node.is_element())
+     }
+
+     fn first_element_child(&self) -> Option<Self> {
+@@ -1719,6 +1738,8 @@ pub struct RecalcStyle<'a> {
+     /// dedicated storage on the node (see `flush_image_layers_from_style`)
+     /// because their style changed during this traversal.
+     nodes_needing_style_image_flush: Mutex<Vec<NodeId>>,
++    /// Whether this traversal styled any element or eager pseudo-element as a query container.
++    saw_size_container: AtomicBool,
+ }
+
+ impl<'a> RecalcStyle<'a> {
+@@ -1726,10 +1747,15 @@ impl<'a> RecalcStyle<'a> {
+         RecalcStyle {
+             context,
+             nodes_needing_style_image_flush: Mutex::new(Vec::new()),
++            saw_size_container: AtomicBool::new(false),
+         }
+     }
+ }
+
++fn is_size_container_style(style: &ComputedValues) -> bool {
++    !style.get_box().clone_container_type().is_normal()
++}
++
+ #[allow(unsafe_code)]
+ impl<'dom> DomTraversal<BlitzNode<'dom>> for RecalcStyle<'_> {
+     fn process_preorder<F: FnMut(BlitzNode<'dom>)>(
+@@ -1766,6 +1792,17 @@ impl<'dom> DomTraversal<BlitzNode<'dom>> for RecalcStyle<'_> {
+
+             sync_pseudo_element_styles(el, &data, &self.nodes_needing_style_image_flush);
+
++            if !self.saw_size_container.load(Ordering::Relaxed) {
++                let pseudos = data.styles.pseudos.as_optional_array();
++                let container = data.styles.get_primary().is_some_and(|s| is_size_container_style(s))
++                    || pseudos.is_some_and(|styles| {
++                        styles.iter().flatten().any(|s| is_size_container_style(s))
++                    });
++                if container {
++                    self.saw_size_container.store(true, Ordering::Relaxed);
++                }
++            }
++
+             if !data.damage.is_empty() {
+                 // Mark the ancestor chain so that the damage propagation pass
+                 // visits this element.
+diff --git a/src/url.rs b/src/url.rs
+index 4e0c4dd..11026f0 100644
+--- a/src/url.rs
++++ b/src/url.rs
+@@ -11,6 +11,10 @@ pub(crate) struct DocumentUrl {
+ }
+
+ impl DocumentUrl {
++    pub(crate) fn same_url(&self, other: &DocumentUrl) -> bool {
++        ServoArc::ptr_eq(&self.base_url, &other.base_url)
++    }
++
+     /// Create a stylo `UrlExtraData` from the URL
+     pub(crate) fn url_extra_data(&self) -> UrlExtraData {
+         UrlExtraData(ServoArc::clone(&self.base_url))
