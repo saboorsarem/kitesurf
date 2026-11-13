@@ -50,27 +50,45 @@ function countOccurrences(source, needle) {
   return count;
 }
 
-// Throws when the glue lacks exactly one of each known window or has an unknown one.
-/** @param {string} source wasm-bindgen `--target web` glue @returns {string} */
+/**
+ * Rewrites the known Wasm memory windows in wasm-bindgen `--target web` glue. Throws when a known
+ * window is missing or repeated, or when an unknown one remains.
+ *
+ * @param {string} source glue source
+ * @returns {string} rewritten glue
+ */
 export function rewriteWasmMemoryViews(source) {
   const problems = [];
-  let rewritten = source;
-  for (const [window, view] of WASM_MEMORY_VIEW_REWRITES) {
-    const count = countOccurrences(source, window);
-    if (count !== 1) {
-      problems.push(`expected exactly one ${JSON.stringify(window)}, found ${count}`);
-    }
-    rewritten = rewritten.split(window).join(view);
-  }
-  for (const line of rewritten.split("\n")) {
-    if (MEMORY_WINDOW.test(line)) {
-      problems.push(`unrewritten Wasm memory window ${JSON.stringify(line.trim())}`);
-    }
-  }
+  const rewritten = rewriteKnownWindows(source, problems);
+  problems.push(...unrewrittenWindowsIn(rewritten));
   if (problems.length > 0) {
     throw new Error(
       `wasm-bindgen glue drift: ${problems.join("; ")}. Revisit scripts/wasm-memory-views.mjs.`,
     );
   }
   return rewritten;
+}
+
+/** @param {string} source @param {string[]} problems @returns {string} */
+function rewriteKnownWindows(source, problems) {
+  let rewritten = source;
+  for (const [subarray, view] of WASM_MEMORY_VIEW_REWRITES) {
+    const count = countOccurrences(source, subarray);
+    if (count !== 1) {
+      problems.push(`expected exactly one ${JSON.stringify(subarray)}, found ${count}`);
+    }
+    rewritten = rewritten.split(subarray).join(view);
+  }
+  return rewritten;
+}
+
+/** @param {string} source @returns {string[]} */
+function unrewrittenWindowsIn(source) {
+  const problems = [];
+  for (const line of source.split("\n")) {
+    if (MEMORY_WINDOW.test(line)) {
+      problems.push(`unrewritten Wasm memory window ${JSON.stringify(line.trim())}`);
+    }
+  }
+  return problems;
 }
