@@ -23,13 +23,13 @@ breadth-first, so every other element at a depth passes through the cache betwee
 two cousins; 64 entries keep 2.8 MB fewer styles on the HTML spec and 1.5 MB on
 TC39 at no measurable CPU cost.
 ---
- invalidation/element/invalidation_map.rs | 12 ++++++++++++
- sharing/mod.rs                           | 14 +++++++++-----
+ invalidation/element/invalidation_map.rs | 13 +++++++++++++
+ sharing/mod.rs                           | 17 +++++++++++------
  values/computed/length_percentage.rs     |  4 +++-
- 3 files changed, 24 insertions(+), 6 deletions(-)
+ 3 files changed, 27 insertions(+), 7 deletions(-)
 
 diff --git a/invalidation/element/invalidation_map.rs b/invalidation/element/invalidation_map.rs
-index 498fe8d..bd83c38 100644
+index 498fe8d..0e90c7f 100644
 --- a/invalidation/element/invalidation_map.rs
 +++ b/invalidation/element/invalidation_map.rs
 @@ -399,6 +399,9 @@ pub struct AdditionalRelativeSelectorInvalidationMap {
@@ -50,23 +50,24 @@ index 498fe8d..bd83c38 100644
          }
      }
 
-@@ -1316,6 +1320,14 @@ impl<'a, 'b> RelativeSelectorDependencyCollector<'a, 'b> {
+@@ -1316,6 +1320,15 @@ impl<'a, 'b> RelativeSelectorDependencyCollector<'a, 'b> {
              | RelativeSelectorMatchHint::InSubtree => true,
              _ => false,
          };
++
 +        self.additional_relative_selector_invalidation_map
-+            .has_sibling_relative_selectors |= match self.selector.match_hint {
++            .has_sibling_relative_selectors |= matches!(
++            self.selector.match_hint,
 +            RelativeSelectorMatchHint::InNextSibling
-+            | RelativeSelectorMatchHint::InSibling
-+            | RelativeSelectorMatchHint::InNextSiblingSubtree
-+            | RelativeSelectorMatchHint::InSiblingSubtree => true,
-+            RelativeSelectorMatchHint::InChild | RelativeSelectorMatchHint::InSubtree => false,
-+        };
++                | RelativeSelectorMatchHint::InSibling
++                | RelativeSelectorMatchHint::InNextSiblingSubtree
++                | RelativeSelectorMatchHint::InSiblingSubtree
++        );
          loop {
              // Reset the compound state.
              self.compound_state = PerCompoundState::new(index);
 diff --git a/sharing/mod.rs b/sharing/mod.rs
-index ef4c5f9..fc6d102 100644
+index ef4c5f9..dbf95eb 100644
 --- a/sharing/mod.rs
 +++ b/sharing/mod.rs
 @@ -91,9 +91,10 @@ mod checks;
@@ -83,14 +84,17 @@ index ef4c5f9..fc6d102 100644
 
  /// The max amount of DOM depths we keep around to share styles across. See bug 2052731.
  const SHARING_MAX_LEVELS: usize = 8;
-@@ -960,8 +961,11 @@ impl<E: TElement> StyleSharingCache<E> {
+@@ -959,9 +960,13 @@ impl<E: TElement> StyleSharingCache<E> {
+             // Rule nodes and styles are computed independent of the element's actual visitedness,
              // but at the end of the cascade (in `adjust_for_visited`) we do store the
              // RELEVANT_LINK_VISITED flag, so we can't share by rule node between visited and
-             // unvisited styles. We don't check for visitedness and just refuse to share for links
+-            // unvisited styles. We don't check for visitedness and just refuse to share for links
 -            // entirely, so that visitedness doesn't affect timing.
 -            if target.is_link() || candidate.element.is_link() {
-+            // entirely, so that visitedness doesn't affect timing. Without visited styles no
-+            // link is styled as visited, so links share by rule node with other links.
++            // unvisited styles. We don't check for visitedness: we refuse to share between a link
++            // and a non-link, and between two links while visited styles are enabled, so that
++            // visitedness doesn't affect timing. Without visited styles no link is styled as
++            // visited, so links share by rule node with other links.
 +            if target.is_link() != candidate.element.is_link()
 +                || (target.is_link() && shared_context.visited_styles_enabled)
 +            {
