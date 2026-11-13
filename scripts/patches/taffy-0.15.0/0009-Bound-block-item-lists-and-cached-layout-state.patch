@@ -14,15 +14,15 @@ round-trip exactly. CacheInner drops from 108 to 96 bytes, the next slab class
 down, and CachedLayout compares the rebuilt outputs so cache equality keeps its
 meaning.
 ---
- src/compute/block.rs |  13 +++--
- src/tree/cache.rs    | 125 +++++++++++++++++++++++++++++++++++++++----
- 2 files changed, 124 insertions(+), 14 deletions(-)
+ src/compute/block.rs |  15 ++++--
+ src/tree/cache.rs    | 121 +++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 122 insertions(+), 14 deletions(-)
 
 diff --git a/src/compute/block.rs b/src/compute/block.rs
-index 6003a4d..d89dbb1 100644
+index 261162a..bd819dc 100644
 --- a/src/compute/block.rs
 +++ b/src/compute/block.rs
-@@ -875,13 +875,18 @@ fn compute_inner(
+@@ -880,13 +880,19 @@ fn compute_inner(
  }
 
  /// Create a `Vec` of `BlockItem` structs where each item in the `Vec` represents a child of the current node
@@ -36,26 +36,28 @@ index 6003a4d..d89dbb1 100644
      node_inner_size: Size<Option<f32>>,
  ) -> Vec<BlockItem> {
 -    tree.child_ids(node)
-+    // The filter hides the length from `collect`, which would then grow by doubling: reserve
-+    // the child count, an upper bound, so a block with many children allocates once.
++    // The display:none filter hides the length from the iterator, so an unreserved `Vec` would
++    // grow by doubling: reserve the child count, an upper bound, so a block with many children
++    // allocates once.
 +    let mut items = Vec::with_capacity(tree.child_count(node));
-+    items.extend(tree.child_ids(node)
++    let children = tree.child_ids(node)
          .map(|child_node_id| (child_node_id, tree.get_block_child_style(child_node_id)))
          .filter(|(_, style)| style.box_generation_mode() != BoxGenerationMode::None)
          .enumerate()
-@@ -967,8 +972,8 @@ fn generate_item_list(
+@@ -972,8 +978,9 @@ fn generate_item_list(
                  location: None,
                  oof_candidates: OofCandidates::new(),
              }
 -        })
 -        .collect()
-+        }));
++        });
++    items.extend(children);
 +    items
  }
 
  /// Resolve the `stretch` sizing keyword for an item's height style. In the block axis the
 diff --git a/src/tree/cache.rs b/src/tree/cache.rs
-index 12ea998..3e040bc 100644
+index a09ee05..583a10a 100644
 --- a/src/tree/cache.rs
 +++ b/src/tree/cache.rs
 @@ -216,7 +216,7 @@ pub(crate) struct CacheEntry<T> {
@@ -89,7 +91,7 @@ index 12ea998..3e040bc 100644
      const OOF_AREA: u8 = 0b100;
 
      /// Return the optional value if `bit` is set in `presence`
-@@ -273,18 +275,72 @@ impl CachedLayout {
+@@ -273,18 +275,68 @@ impl CachedLayout {
              bottom_margin: self.bottom_margin,
              margins_can_collapse_through: self.margins_can_collapse_through,
              oof_candidates: self.oof_candidates.clone(),
@@ -126,6 +128,11 @@ index 12ea998..3e040bc 100644
 +/// the fields directly would make a [`Cache`] unequal to a cache holding an equal output.
 +impl PartialEq for CachedLayout {
 +    fn eq(&self, other: &Self) -> bool {
++        #[cfg(feature = "content_size")]
++        let overflow_rects_match = self.scrollable_overflow_rect == other.scrollable_overflow_rect;
++        #[cfg(not(feature = "content_size"))]
++        let overflow_rects_match = true;
++
 +        self.size == other.size
 +            && self.present(Self::FIRST_BASELINE, self.first_baseline)
 +                == other.present(Self::FIRST_BASELINE, other.first_baseline)
@@ -136,16 +143,7 @@ index 12ea998..3e040bc 100644
 +            && self.margins_can_collapse_through == other.margins_can_collapse_through
 +            && self.oof_candidates == other.oof_candidates
 +            && self.oof_positioning_area() == other.oof_positioning_area()
-+            && {
-+                #[cfg(feature = "content_size")]
-+                {
-+                    self.scrollable_overflow_rect == other.scrollable_overflow_rect
-+                }
-+                #[cfg(not(feature = "content_size"))]
-+                {
-+                    true
-+                }
-+            }
++            && overflow_rects_match
      }
  }
 
@@ -165,7 +163,7 @@ index 12ea998..3e040bc 100644
          Self {
              size: output.size,
              #[cfg(feature = "content_size")]
-@@ -294,7 +350,7 @@ impl From<LayoutOutput> for CachedLayout {
+@@ -294,7 +346,7 @@ impl From<LayoutOutput> for CachedLayout {
              top_margin: output.top_margin,
              bottom_margin: output.bottom_margin,
              oof_candidates: output.oof_candidates,
@@ -174,20 +172,20 @@ index 12ea998..3e040bc 100644
              margins_can_collapse_through: output.margins_can_collapse_through,
              presence,
          }
-@@ -334,9 +390,10 @@ impl CacheInner {
+@@ -382,9 +434,10 @@ impl CacheInner {
      }
  }
 
 -// A box larger than 108 bytes lands in dlmalloc's 128-byte chunk instead of the 112-byte one.
-+// Above 48 bytes the slab allocator rounds requests to 8-byte classes, so a byte over this
-+// boundary costs 8 bytes on every node that caches a layout.
++// Requests above 48 bytes round up to 8-byte classes, so a byte over 96 costs 8 more bytes on
++// every node that caches a layout.
  #[cfg(target_pointer_width = "32")]
 -const _: () = assert!(core::mem::size_of::<CacheInner>() <= 108);
 +const _: () = assert!(core::mem::size_of::<CacheInner>() <= 96);
 
  /// Serialize the final entry with the shape of a `CacheEntry<LayoutOutput>`
  #[cfg(feature = "serde")]
-@@ -777,6 +834,54 @@ mod tests {
+@@ -792,6 +845,54 @@ mod tests {
          assert_eq!(restored, layout);
      }
 
