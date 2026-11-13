@@ -17,18 +17,20 @@ Collect parsed attributes straight into the element's list: Attributes collects 
 an iterator, so the parser maps html5ever's attributes into it directly instead of
 collecting a Vec first.
 ---
- src/html_sink.rs | 42 +++++++++++++++++++++++++++++++-----------
- 1 file changed, 31 insertions(+), 11 deletions(-)
+ src/html_sink.rs | 46 ++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 32 insertions(+), 14 deletions(-)
 
 diff --git a/src/html_sink.rs b/src/html_sink.rs
-index 4e5077a..cee8608 100644
+index 4e5077a..7cf0764 100644
 --- a/src/html_sink.rs
 +++ b/src/html_sink.rs
-@@ -7,9 +7,10 @@ use std::borrow::Cow;
+@@ -6,20 +6,38 @@ use html5ever::tree_builder::TreeBuilderOpts;
+ use std::borrow::Cow;
  use std::cell::{Cell, Ref, RefCell, RefMut};
 
- use blitz_dom::node::Attribute;
+-use blitz_dom::node::Attribute;
 -use blitz_dom::{DocumentMutator, HtmlParserProvider, NodeId};
++use blitz_dom::node::{Attribute, Attributes};
 +use blitz_dom::{DocumentMutator, ElementData, HtmlParserProvider, NodeId};
  use html5ever::{
 -    QualName,
@@ -37,9 +39,10 @@ index 4e5077a..cee8608 100644
      tendril::{StrTendril, TendrilSink},
      tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink},
  };
-@@ -17,9 +18,27 @@ use html5ever::{
- /// Convert an html5ever Attribute which uses tendril for its value to a blitz Attribute
- /// which uses String.
+
+-/// Convert an html5ever Attribute which uses tendril for its value to a blitz Attribute
+-/// which uses String.
++/// Convert an html5ever Attribute, which uses tendril for its value, to a blitz Attribute.
  fn html5ever_to_blitz_attr(attr: html5ever::Attribute) -> Attribute {
 -    Attribute {
 -        name: attr.name,
@@ -52,7 +55,7 @@ index 4e5077a..cee8608 100644
 +
 +impl std::fmt::Debug for SinkElemName<'_> {
 +    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-+        self.0.expanded_name().fmt(f)
++        write!(f, "{:?}", self.0.expanded_name())
 +    }
 +}
 +
@@ -68,7 +71,7 @@ index 4e5077a..cee8608 100644
      }
  }
 
-@@ -346,7 +365,7 @@ impl<'m, 'doc> DocumentHtmlParser<'m, 'doc> {
+@@ -346,7 +364,7 @@ impl<'m, 'doc> DocumentHtmlParser<'m, 'doc> {
 
          // html5ever creates a new fragment root node under the document node and parses the nodes into that fragment root.
          // So here we move the children of the fragment root to element_id and then drop the fragment root.
@@ -77,7 +80,7 @@ index 4e5077a..cee8608 100644
          let fragment_root_id = mutr.last_child_id(document_id).unwrap();
          let child_ids = mutr.child_ids(fragment_root_id);
          mutr.append_children(element_id, &child_ids);
-@@ -361,7 +380,7 @@ impl<'m, 'doc> TreeSink for DocumentHtmlParser<'m, 'doc> {
+@@ -361,7 +379,7 @@ impl<'m, 'doc> TreeSink for DocumentHtmlParser<'m, 'doc> {
      type Handle = NodeId;
 
      type ElemName<'a>
@@ -86,7 +89,7 @@ index 4e5077a..cee8608 100644
      where
          Self: 'a;
 
-@@ -377,14 +396,14 @@ impl<'m, 'doc> TreeSink for DocumentHtmlParser<'m, 'doc> {
+@@ -377,14 +395,14 @@ impl<'m, 'doc> TreeSink for DocumentHtmlParser<'m, 'doc> {
      }
 
      fn get_document(&self) -> Self::Handle {
@@ -104,12 +107,11 @@ index 4e5077a..cee8608 100644
      }
 
      fn create_element(
-@@ -393,6 +412,7 @@ impl<'m, 'doc> TreeSink for DocumentHtmlParser<'m, 'doc> {
+@@ -393,6 +411,6 @@ impl<'m, 'doc> TreeSink for DocumentHtmlParser<'m, 'doc> {
          attrs: Vec<html5ever::Attribute>,
          _flags: ElementFlags,
      ) -> Self::Handle {
 -        let attrs = attrs.into_iter().map(html5ever_to_blitz_attr).collect();
-+        let attrs: blitz_dom::node::Attributes =
-+            attrs.into_iter().map(html5ever_to_blitz_attr).collect();
++        let attrs: Attributes = attrs.into_iter().map(html5ever_to_blitz_attr).collect();
          self.mutr().create_element(name, attrs)
      }

@@ -5,15 +5,15 @@ Subject: [PATCH] Let a streaming reader sniff XHTML from a document prefix
 
 is_xhtml_document needs the document up to its root tag, which follows an unbounded prolog, so a reader that streams the page had to hold all of it. is_xhtml_document_prefix answers as soon as no continuation can change the answer: the sniff marks every point where it reads past its input, and returns None while any was reached. is_xhtml_document keeps its answer for complete input.
 ---
- src/html_sink.rs | 142 ++++++++++++++++++++++++++++++++++++-----------
+ src/html_sink.rs | 175 +++++++++++++++++++++++++++++++++++------------
  src/lib.rs       |   2 +-
- 2 files changed, 111 insertions(+), 33 deletions(-)
+ 2 files changed, 134 insertions(+), 43 deletions(-)
 
 diff --git a/src/html_sink.rs b/src/html_sink.rs
-index cee8608..ca2d73e 100644
+index 7cf0764..b84a893 100644
 --- a/src/html_sink.rs
 +++ b/src/html_sink.rs
-@@ -91,7 +91,19 @@ fn contains_xhtml_marker(source: &[u8]) -> bool {
+@@ -90,7 +90,19 @@ fn contains_xhtml_marker(source: &[u8]) -> bool {
          .any(|window| window == b"XHTML" || window == b"xhtml")
  }
 
@@ -34,7 +34,7 @@ index cee8608..ca2d73e 100644
      const DOCTYPE: &[u8] = b"<!DOCTYPE";
      if !source.starts_with(DOCTYPE) {
          return None;
-@@ -111,9 +123,9 @@ fn doctype_info(source: &[u8]) -> Option<(usize, bool)> {
+@@ -110,9 +122,9 @@ fn doctype_info(source: &[u8]) -> Option<(usize, bool)> {
              continue;
          }
          // Comment text is not evidence that the doctype identifies XHTML.
@@ -46,7 +46,7 @@ index cee8608..ca2d73e 100644
              segment_start = i;
              continue;
          }
-@@ -131,6 +143,7 @@ fn doctype_info(source: &[u8]) -> Option<(usize, bool)> {
+@@ -130,6 +142,7 @@ fn doctype_info(source: &[u8]) -> Option<(usize, bool)> {
          }
          i += 1;
      }
@@ -54,7 +54,7 @@ index cee8608..ca2d73e 100644
      None
  }
 
-@@ -138,25 +151,30 @@ fn is_xml_whitespace(byte: u8) -> bool {
+@@ -137,25 +150,32 @@ fn is_xml_whitespace(byte: u8) -> bool {
      matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
  }
 
@@ -71,18 +71,20 @@ index cee8608..ca2d73e 100644
 
  /// The index just past the first `terminator` at or after `from`.
 -fn skip_past(bytes: &[u8], from: usize, terminator: &[u8]) -> Option<usize> {
-+fn skip_past(bytes: &[u8], from: usize, terminator: &[u8], ran_out: &RanOut) -> Option<usize> {
-     let end = bytes
+-    let end = bytes
 -        .get(from..)?
 -        .windows(terminator.len())
 -        .position(|window| window == terminator)?;
--    Some(from + end + terminator.len())
-+        .get(from..)
-+        .and_then(|rest| rest.windows(terminator.len()).position(|window| window == terminator));
-+    if end.is_none() {
++fn skip_past(bytes: &[u8], from: usize, terminator: &[u8], ran_out: &RanOut) -> Option<usize> {
++    let end = bytes.get(from..).and_then(|rest| {
++        rest.windows(terminator.len())
++            .position(|window| window == terminator)
++    });
++    let Some(end) = end else {
 +        ran_out.set(true);
-+    }
-+    Some(from + end? + terminator.len())
++        return None;
++    };
+     Some(from + end + terminator.len())
  }
 
 -fn find_html_root_tag(source: &str, start: usize) -> Option<&str> {
@@ -93,7 +95,7 @@ index cee8608..ca2d73e 100644
      if bytes.get(tag_start) != Some(&b'<') {
          return None;
      }
-@@ -169,6 +187,9 @@ fn find_html_root_tag(source: &str, start: usize) -> Option<&str> {
+@@ -168,6 +188,9 @@ fn find_html_root_tag(source: &str, start: usize) -> Option<&str> {
      {
          name_end += 1;
      }
@@ -103,7 +105,7 @@ index cee8608..ca2d73e 100644
      if !bytes[name_start..name_end].eq_ignore_ascii_case(b"html") {
          return None;
      }
-@@ -187,15 +208,18 @@ fn find_html_root_tag(source: &str, start: usize) -> Option<&str> {
+@@ -186,15 +209,18 @@ fn find_html_root_tag(source: &str, start: usize) -> Option<&str> {
              }
          }
      }
@@ -114,7 +116,7 @@ index cee8608..ca2d73e 100644
  fn html_root_tag_has_xhtml_namespace(tag: &str) -> bool {
      let bytes = tag.as_bytes();
      let mut i = 5;
-+    // The tag is whole, through its `>`.
++    // The tag is whole through its `>`, so the sniff's exhaustion notes are discarded.
 +    let ran_out = &RanOut::new(false);
 
      while i < bytes.len() {
@@ -123,7 +125,7 @@ index cee8608..ca2d73e 100644
          if matches!(bytes.get(i), Some(b'>' | b'/')) {
              i += 1;
              continue;
-@@ -213,11 +237,11 @@ fn html_root_tag_has_xhtml_namespace(tag: &str) -> bool {
+@@ -212,11 +238,11 @@ fn html_root_tag_has_xhtml_namespace(tag: &str) -> bool {
          }
          let name = &bytes[name_start..i];
 
@@ -137,7 +139,7 @@ index cee8608..ca2d73e 100644
              let Some(&quote @ (b'"' | b'\'')) = bytes.get(i) else {
                  return false;
              };
-@@ -240,18 +264,19 @@ fn html_root_tag_has_xhtml_namespace(tag: &str) -> bool {
+@@ -239,18 +265,19 @@ fn html_root_tag_has_xhtml_namespace(tag: &str) -> bool {
      false
  }
 
@@ -165,7 +167,7 @@ index cee8608..ca2d73e 100644
          } else {
              return Some(i);
          }
-@@ -261,34 +286,54 @@ fn skip_prolog_misc(source: &str, mut i: usize) -> Option<usize> {
+@@ -260,34 +287,59 @@ fn skip_prolog_misc(source: &str, mut i: usize) -> Option<usize> {
  /// Returns whether the source should use the XML parser based on its XML declaration,
  /// doctype text, or the default namespace on its root `<html>` tag.
  pub fn is_xhtml_document(html: &str) -> bool {
@@ -180,6 +182,18 @@ index cee8608..ca2d73e 100644
 +    (!ran_out.get()).then_some(is_xhtml)
 +}
 +
++/// Whether the document opens with an XML declaration: `<?xml` then whitespace or `?`.
++fn starts_with_xml_declaration(bytes: &[u8], ran_out: &RanOut) -> bool {
++    if !starts_with_or_ran_out(bytes, b"<?xml", ran_out) {
++        return false;
++    }
++    let Some(&next) = bytes.get(5) else {
++        ran_out.set(true);
++        return false;
++    };
++    next.is_ascii_whitespace() || next == b'?'
++}
++
 +fn sniff_xhtml(html: &str, ran_out: &RanOut) -> bool {
 +    if html.is_empty() {
 +        ran_out.set(true);
@@ -189,15 +203,10 @@ index cee8608..ca2d73e 100644
 -        .strip_prefix("<?xml")
 -        .and_then(|rest| rest.as_bytes().first())
 -        .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'?');
-+    let is_xml_declaration = starts_with_or_ran_out(html.as_bytes(), b"<?xml", ran_out)
-+        && match html.as_bytes().get(5) {
-+            Some(byte) => byte.is_ascii_whitespace() || *byte == b'?',
-+            None => {
-+                ran_out.set(true);
-+                false
-+            }
-+        };
-     if is_xml_declaration {
+-    if is_xml_declaration {
++    let bytes = html.as_bytes();
++
++    if starts_with_xml_declaration(bytes, ran_out) {
          return true;
      }
 
@@ -207,30 +216,38 @@ index cee8608..ca2d73e 100644
      };
 -    if html[prolog_start..].starts_with("<!DOCTYPE") {
 -        let Some((doctype_end, mentions_xhtml)) = doctype_info(&html.as_bytes()[prolog_start..])
-+    if starts_with_or_ran_out(&html.as_bytes()[prolog_start..], b"<!DOCTYPE", ran_out) {
-+        let Some((doctype_end, mentions_xhtml)) =
-+            doctype_info(&html.as_bytes()[prolog_start..], ran_out)
-         else {
-             return false;
-         };
-         // Text/html pages often put `<html xmlns=...>` on the line after
-         // `<!DOCTYPE html>`; only a root on the doctype's line routes to XML.
-         let root_search_start = prolog_start + doctype_end;
+-        else {
+-            return false;
+-        };
+-        // Text/html pages often put `<html xmlns=...>` on the line after
+-        // `<!DOCTYPE html>`; only a root on the doctype's line routes to XML.
+-        let root_search_start = prolog_start + doctype_end;
 -        let root_on_doctype_line = skip_prolog_misc(html, root_search_start)
-+        let root_on_doctype_line = skip_prolog_misc(html, root_search_start, ran_out)
-             .is_some_and(|root_start| !html[root_search_start..root_start].contains('\n'));
-         return mentions_xhtml
-             || (root_on_doctype_line
+-            .is_some_and(|root_start| !html[root_search_start..root_start].contains('\n'));
+-        return mentions_xhtml
+-            || (root_on_doctype_line
 -                && root_element_has_xhtml_namespace(html, root_search_start));
-+                && root_element_has_xhtml_namespace(html, root_search_start, ran_out));
++    if !starts_with_or_ran_out(&bytes[prolog_start..], b"<!DOCTYPE", ran_out) {
++        return root_element_has_xhtml_namespace(html, prolog_start, ran_out);
      }
 
 -    root_element_has_xhtml_namespace(html, prolog_start)
-+    root_element_has_xhtml_namespace(html, prolog_start, ran_out)
++    let Some((doctype_end, mentions_xhtml)) = doctype_info(&bytes[prolog_start..], ran_out) else {
++        return false;
++    };
++    // Text/html pages often put `<html xmlns=...>` on the line after
++    // `<!DOCTYPE html>`; only a root on the doctype's line routes to XML.
++    let root_search_start = prolog_start + doctype_end;
++    let root_on_doctype_line = skip_prolog_misc(html, root_search_start, ran_out)
++        .is_some_and(|root_start| !html[root_search_start..root_start].contains('\n'));
++
++    mentions_xhtml
++        || (root_on_doctype_line
++            && root_element_has_xhtml_namespace(html, root_search_start, ran_out))
  }
 
  impl<'m, 'doc> DocumentHtmlParser<'m, 'doc> {
-@@ -589,3 +634,36 @@ fn xhtml_sniff_uses_only_the_doctype_and_root_namespace() {
+@@ -587,3 +639,42 @@ fn xhtml_sniff_uses_only_the_doctype_and_root_namespace() {
           \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\"><html></html>"
      ));
  }
@@ -263,8 +280,14 @@ index cee8608..ca2d73e 100644
 +            }
 +        }
 +    }
-+    // Ordinary pages decide once their root tag is read.
-+    assert_eq!(is_xhtml_document_prefix("<!DOCTYPE html><html lang=\"en\"><head>"), Some(false));
++}
++
++#[test]
++fn xhtml_prefix_sniff_decides_once_the_root_tag_is_read() {
++    assert_eq!(
++        is_xhtml_document_prefix("<!DOCTYPE html><html lang=\"en\"><head>"),
++        Some(false)
++    );
 +    assert_eq!(is_xhtml_document_prefix("<!doctype html>\n<html>"), Some(false));
 +}
 diff --git a/src/lib.rs b/src/lib.rs

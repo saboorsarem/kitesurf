@@ -7,11 +7,11 @@ A u64 field gives NodeId, and every struct holding one, 8-byte alignment.
 On wasm32 that pads each blitz-dom node slot by 4 bytes. Two u32 halves keep
 the same raw value, order, hash and formatting at 4-byte alignment.
 ---
- src/node_id.rs | 46 ++++++++++++++++++++++++++++++++++++++++------
- 1 file changed, 40 insertions(+), 6 deletions(-)
+ src/node_id.rs | 63 +++++++++++++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 57 insertions(+), 6 deletions(-)
 
 diff --git a/src/node_id.rs b/src/node_id.rs
-index 5839c3b..f97b2f2 100644
+index 5839c3b..1b354f0 100644
 --- a/src/node_id.rs
 +++ b/src/node_id.rs
 @@ -8,8 +8,13 @@
@@ -35,11 +35,11 @@ index 5839c3b..f97b2f2 100644
      #[inline(always)]
      pub fn as_u64(self) -> u64 {
 -        self.0
-+        (self.version as u64) << 32 | self.index as u64
++        u64::from(self.version) << 32 | u64::from(self.index)
      }
 
      /// Reconstruct a `NodeId` from the raw `u64` representation produced by
-@@ -28,19 +33,30 @@ impl NodeId {
+@@ -28,19 +33,31 @@ impl NodeId {
      /// which fails to resolve (it will not alias an unrelated live node).
      #[inline(always)]
      pub fn from_u64(raw: u64) -> Self {
@@ -65,7 +65,8 @@ index 5839c3b..f97b2f2 100644
 +    }
 +}
 +
-+/// Hashes the raw `u64`, as the previous representation did, so map orders are unchanged.
++/// Hashes the raw `u64` rather than the two halves, so hash values and map iteration order do
++/// not depend on the representation.
 +impl std::hash::Hash for NodeId {
 +    #[inline]
 +    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -73,7 +74,7 @@ index 5839c3b..f97b2f2 100644
      }
  }
 
-@@ -71,3 +87,21 @@ impl std::fmt::Display for NodeId {
+@@ -71,3 +88,37 @@ impl std::fmt::Display for NodeId {
          write!(f, "{:?}", self)
      }
  }
@@ -84,14 +85,30 @@ index 5839c3b..f97b2f2 100644
 +    use std::hash::{BuildHasher, RandomState};
 +
 +    #[test]
-+    fn halves_round_trip_and_hash_order_like_the_raw_u64() {
++    fn halves_round_trip_through_the_raw_u64() {
 +        let raw = 7 << 32 | 9;
 +        let id = NodeId::from_u64(raw);
-+        assert_eq!((id.as_u64(), id.index(), id.version()), (raw, 9, 7));
-+        assert_eq!(align_of::<NodeId>(), align_of::<u32>());
-+        let hasher = RandomState::new();
-+        assert_eq!(hasher.hash_one(id), hasher.hash_one(raw));
-+        assert!(NodeId::from_u64(2 << 32 | 1) < NodeId::from_u64(1 << 32 | 2));
++
++        assert_eq!(id.as_u64(), raw);
++        assert_eq!((id.index(), id.version()), (9, 7));
 +        assert_eq!(format!("{id}"), "NodeId(9v7)");
++    }
++
++    #[test]
++    fn is_aligned_like_a_u32() {
++        assert_eq!(align_of::<NodeId>(), align_of::<u32>());
++    }
++
++    #[test]
++    fn hashes_like_the_raw_u64() {
++        let raw = 7 << 32 | 9;
++        let hasher = RandomState::new();
++
++        assert_eq!(hasher.hash_one(NodeId::from_u64(raw)), hasher.hash_one(raw));
++    }
++
++    #[test]
++    fn orders_by_index_before_version() {
++        assert!(NodeId::from_u64(2 << 32 | 1) < NodeId::from_u64(1 << 32 | 2));
 +    }
 +}
