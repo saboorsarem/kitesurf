@@ -11,9 +11,9 @@ prepared once and kept with the recorded context until every band is rendered.
  src/dispatch/single_threaded.rs |   3 +
  src/fine/mod.rs                 |   2 +
  src/lib.rs                      |   3 +-
- src/region.rs                   |  14 +++-
- src/render.rs                   | 132 +++++++++++++++++++++++++++++---
- 6 files changed, 142 insertions(+), 14 deletions(-)
+ src/region.rs                   |  18 +++-
+ src/render.rs                   | 158 ++++++++++++++++++++++++++++++--
+ 6 files changed, 172 insertions(+), 14 deletions(-)
 
 diff --git a/src/dispatch/multi_threaded.rs b/src/dispatch/multi_threaded.rs
 index 3a7803b..b5a4d6e 100644
@@ -90,10 +90,10 @@ index 72c966d..6a71325 100644
  // Note: The first one is not something that should be
  // exposed, but is currently needed by vello_tests.
 diff --git a/src/region.rs b/src/region.rs
-index adf7ff8..9edf215 100644
+index adf7ff8..d3ba03e 100644
 --- a/src/region.rs
 +++ b/src/region.rs
-@@ -120,13 +120,16 @@ impl<'a> Regions<'a> {
+@@ -120,13 +120,17 @@ impl<'a> Regions<'a> {
          target: &'a mut PixmapMut<'_>,
          scene_size: (u16, u16),
          offset: (u16, u16),
@@ -105,17 +105,20 @@ index adf7ff8..9edf215 100644
          let (scene_width, scene_height) = scene_size;
          let width = scene_width.min(target.width().saturating_sub(dst_x));
 -        let height = scene_height.min(target.height().saturating_sub(dst_y));
++        // Rows above `source_y` belong to earlier bands and are not rendered here.
 +        let height = scene_height
 +            .saturating_sub(source_y)
 +            .min(target.height().saturating_sub(dst_y));
 
          if width == 0 || height == 0 {
              return Self {
-@@ -134,7 +137,10 @@ impl<'a> Regions<'a> {
+@@ -134,7 +138,12 @@ impl<'a> Regions<'a> {
              };
          }
 
 -        let row_count = row_count.min(usize::from(height).div_ceil(Tile::HEIGHT as usize));
++        // Regions keep absolute scene row indices, so the rows above `source_y` are dropped from
++        // the bucketer's row count instead of being renumbered.
 +        let first_row = usize::from(source_y / Tile::HEIGHT);
 +        let row_count = row_count
 +            .saturating_sub(first_row)
@@ -123,16 +126,18 @@ index adf7ff8..9edf215 100644
          let stride = usize::from(target.width()) * COLOR_COMPONENTS;
          let x_offset = usize::from(dst_x) * COLOR_COMPONENTS;
          let render_bytes = usize::from(height) * stride;
-@@ -148,7 +154,7 @@ impl<'a> Regions<'a> {
+@@ -147,8 +156,9 @@ impl<'a> Regions<'a> {
+             let row_height = (height - row_y).min(Tile::HEIGHT);
              let band_len = usize::from(row_height) * stride;
              let (buffer, rest) = remaining.split_at_mut(band_len);
++            let scene_row = first_row + row_idx;
              regions.push(Region::from_rows(
 -                row_idx, width, row_height, stride, x_offset, buffer,
-+                first_row + row_idx, width, row_height, stride, x_offset, buffer,
++                scene_row, width, row_height, stride, x_offset, buffer,
              ));
              remaining = rest;
          }
-@@ -178,7 +184,7 @@ mod tests {
+@@ -178,7 +188,7 @@ mod tests {
          for offset in [(20, 0), (0, 20)] {
              let mut pixmap = Pixmap::new(10, 10);
              let mut pixmap = pixmap.as_mut();
@@ -142,7 +147,7 @@ index adf7ff8..9edf215 100644
      }
  }
 diff --git a/src/render.rs b/src/render.rs
-index ef6f07a..55f89ec 100644
+index ef6f07a..a85fbbc 100644
 --- a/src/render.rs
 +++ b/src/render.rs
 @@ -32,6 +32,7 @@ use vello_common::peniko::color::palette::css::BLACK;
@@ -153,7 +158,7 @@ index ef6f07a..55f89ec 100644
  use vello_common::transforms::{RootTransforms, Transforms};
  use vello_common::util::into_fast_path_rect;
 
-@@ -90,6 +91,46 @@ impl Resources {
+@@ -90,6 +91,48 @@ impl Resources {
      }
  }
 
@@ -191,6 +196,8 @@ index ef6f07a..55f89ec 100644
 +        target: impl Into<PixmapMut<'a>>,
 +        mut settings: RasterizerSettings,
 +    ) {
++        settings.assert_source_y_aligned();
++        // The resources were prepared for this mode, so a caller's mode would mismatch them.
 +        settings.render_mode = self.render_mode;
 +        self.context
 +            .rasterize_prepared(target.into(), &self.resources, settings);
@@ -200,7 +207,7 @@ index ef6f07a..55f89ec 100644
  /// How the destination pixmap is initialized before rendering.
  pub type TargetInit = vello_common::TargetInit<AlphaColor<Srgb>>;
 
-@@ -122,6 +163,8 @@ pub struct RasterizerSettings {
+@@ -122,6 +165,8 @@ pub struct RasterizerSettings {
      ///
      /// See [`RenderContext::render_with`] for more information.
      pub offset: (u16, u16),
@@ -209,7 +216,7 @@ index ef6f07a..55f89ec 100644
  }
 
  impl Default for RasterizerSettings {
-@@ -131,6 +174,7 @@ impl Default for RasterizerSettings {
+@@ -131,10 +176,22 @@ impl Default for RasterizerSettings {
              target_init: TargetInit::Clear(AlphaColor::TRANSPARENT),
              pixel_format: PixelFormat::Rgba8,
              offset: (0, 0),
@@ -217,19 +224,30 @@ index ef6f07a..55f89ec 100644
          }
      }
  }
-@@ -846,6 +890,11 @@ impl RenderContext {
-         resources: &mut Resources,
-         settings: RasterizerSettings,
-     ) {
+
++impl RasterizerSettings {
++    /// Panic unless `source_y` starts on a tile row boundary.
++    fn assert_source_y_aligned(&self) {
 +        assert_eq!(
-+            settings.source_y % Tile::HEIGHT,
++            self.source_y % Tile::HEIGHT,
 +            0,
 +            "source_y must be aligned to four pixels"
 +        );
++    }
++}
++
+ /// A render context for CPU-based 2D graphics rendering.
+ ///
+ /// This is the main entry point for drawing operations. It maintains the current
+@@ -846,6 +903,7 @@ impl RenderContext {
+         resources: &mut Resources,
+         settings: RasterizerSettings,
+     ) {
++        settings.assert_source_y_aligned();
          // TODO: Maybe we should move those checks into the dispatcher.
          assert!(
              !self.dispatcher.has_layers(),
-@@ -853,10 +902,25 @@ impl RenderContext {
+@@ -853,10 +911,20 @@ impl RenderContext {
          );
 
          resources.before_render(settings.render_mode);
@@ -245,11 +263,6 @@ index ef6f07a..55f89ec 100644
 +        resources: &Resources,
 +        settings: RasterizerSettings,
 +    ) {
-+        assert_eq!(
-+            settings.source_y % Tile::HEIGHT,
-+            0,
-+            "source_y must be aligned to four pixels"
-+        );
          let target_fully_covered = settings.offset == (0, 0)
              && self.width >= target.width()
 -            && self.height >= target.height();
@@ -257,7 +270,7 @@ index ef6f07a..55f89ec 100644
          // If the scene covers the whole pixmap than packing will take care
          // of clearing everything anyway, so no reason to clear it explicitly
          // here.
-@@ -895,12 +959,6 @@ impl RenderContext {
+@@ -895,12 +963,6 @@ impl RenderContext {
              &self.encoded_paints,
              &resources.image_registry,
          );
@@ -270,7 +283,7 @@ index ef6f07a..55f89ec 100644
      }
 
      /// Return the width of the scene.
-@@ -1035,7 +1093,9 @@ impl ImageResolver for ImageRegistry {
+@@ -1035,7 +1097,9 @@ impl ImageResolver for ImageRegistry {
  mod tests {
      #[cfg(feature = "text")]
      use crate::peniko::{Blob, FontData};
@@ -281,7 +294,35 @@ index ef6f07a..55f89ec 100644
      #[cfg(feature = "text")]
      use alloc::sync::Arc;
      use alloc::vec;
-@@ -1084,6 +1144,60 @@ mod tests {
+@@ -1055,6 +1119,27 @@ mod tests {
+         a: 255,
+     };
+
++    /// Rows per band in the `source_rows_match_full_frame` test.
++    const BAND_ROWS: u16 = 8;
++
++    /// Render `height` rows of a scene into `out`, `BAND_ROWS` rows at a time.
++    ///
++    /// `render` receives the first scene row, the row count, and the destination slice for one
++    /// band.
++    fn render_in_bands(
++        height: u16,
++        stride: usize,
++        out: &mut [u8],
++        mut render: impl FnMut(u16, u16, &mut [u8]),
++    ) {
++        for start in (0..height).step_by(usize::from(BAND_ROWS)) {
++            let rows = (height - start).min(BAND_ROWS);
++            let offset = usize::from(start) * stride;
++            let end = offset + usize::from(rows) * stride;
++            render(start, rows, &mut out[offset..end]);
++        }
++    }
++
+     fn red_pixel() -> PremulRgba8 {
+         RED.premultiply().to_rgba8()
+     }
+@@ -1084,6 +1169,61 @@ mod tests {
          ctx
      }
 
@@ -294,6 +335,7 @@ index ef6f07a..55f89ec 100644
 +        ctx.set_paint(BLUE);
 +        ctx.fill_rect(&Rect::new(7.2, 12.1, 40.0, 36.4));
 +        ctx.flush();
++
 +        let mut resources = Resources::new();
 +        let stride = usize::from(width) * 4;
 +        let mut full = vec![0; stride * usize::from(height)];
@@ -301,41 +343,41 @@ index ef6f07a..55f89ec 100644
 +            PixmapMut::new(width, height, &mut full).unwrap(),
 +            &mut resources,
 +        );
-+        let mut joined = vec![0; full.len()];
-+        for start in (0..height).step_by(8) {
-+            let band_height = (height - start).min(8);
-+            let offset = usize::from(start) * stride;
-+            let end = offset + usize::from(band_height) * stride;
-+            ctx.render_with(
-+                PixmapMut::new(width, band_height, &mut joined[offset..end]).unwrap(),
-+                &mut resources,
-+                RasterizerSettings {
-+                    source_y: start,
-+                    ..Default::default()
-+                },
-+            );
-+        }
-+        let mut wrong_band = vec![0; 8 * stride];
++
++        // A band rendered without `source_y` repeats the top of the scene, so the comparisons
++        // below only prove anything if `source_y` moves the origin.
++        let band_len = usize::from(BAND_ROWS) * stride;
++        let mut top_band = vec![0; band_len];
 +        ctx.render(
-+            PixmapMut::new(width, 8, &mut wrong_band).unwrap(),
++            PixmapMut::new(width, BAND_ROWS, &mut top_band).unwrap(),
 +            &mut resources,
 +        );
-+        assert_ne!(wrong_band, full[8 * stride..16 * stride]);
-+        assert_eq!(joined, full);
-+        let prepared = PreparedRender::new(ctx, resources, RenderMode::OptimizeSpeed);
-+        joined.fill(0);
-+        for start in (0..height).step_by(8) {
-+            let band_height = (height - start).min(8);
-+            let offset = usize::from(start) * stride;
-+            let end = offset + usize::from(band_height) * stride;
-+            prepared.render_with(
-+                PixmapMut::new(width, band_height, &mut joined[offset..end]).unwrap(),
++        assert_ne!(top_band, full[band_len..2 * band_len]);
++
++        let mut joined = vec![0; full.len()];
++        render_in_bands(height, stride, &mut joined, |source_y, rows, band| {
++            ctx.render_with(
++                PixmapMut::new(width, rows, band).unwrap(),
++                &mut resources,
 +                RasterizerSettings {
-+                    source_y: start,
++                    source_y,
 +                    ..Default::default()
 +                },
 +            );
-+        }
++        });
++        assert_eq!(joined, full);
++
++        let prepared = PreparedRender::new(ctx, resources, RenderMode::OptimizeSpeed);
++        joined.fill(0);
++        render_in_bands(height, stride, &mut joined, |source_y, rows, band| {
++            prepared.render_with(
++                PixmapMut::new(width, rows, band).unwrap(),
++                RasterizerSettings {
++                    source_y,
++                    ..Default::default()
++                },
++            );
++        });
 +        assert_eq!(joined, full);
 +    }
 +
