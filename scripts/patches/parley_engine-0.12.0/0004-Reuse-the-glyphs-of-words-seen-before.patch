@@ -22,10 +22,10 @@ holds up to 2048 words for each of 8 font and option sets.
 ---
  src/lru_cache.rs         |  12 +
  src/shape/mod.rs         |   1 +
- src/shape/shaped_text.rs |  35 ++-
- src/shape/shaper.rs      | 294 +++++++++++++++++++----
- src/shape/word_cache.rs  | 505 +++++++++++++++++++++++++++++++++++++++
- 5 files changed, 776 insertions(+), 71 deletions(-)
+ src/shape/shaped_text.rs |  35 +--
+ src/shape/shaper.rs      | 311 ++++++++++++++++++----
+ src/shape/word_cache.rs  | 545 +++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 833 insertions(+), 71 deletions(-)
  create mode 100644 src/shape/word_cache.rs
 
 diff --git a/src/lru_cache.rs b/src/lru_cache.rs
@@ -177,7 +177,7 @@ index dcd879c..9d701ac 100644
          if cluster.glyphs == 0 && glyph.x == 0. && glyph.y == 0. {
              // Defer this potential zero-offset, single glyph cluster
 diff --git a/src/shape/shaper.rs b/src/shape/shaper.rs
-index f1ad855..06ea0e4 100644
+index f1ad855..90acc59 100644
 --- a/src/shape/shaper.rs
 +++ b/src/shape/shaper.rs
 @@ -5,6 +5,7 @@
@@ -425,7 +425,7 @@ index f1ad855..06ea0e4 100644
      };
 
      // This is the run being accumulated, i.e., consecutive graphemes for which `select_font`
-@@ -429,6 +500,129 @@ fn shape_segment(
+@@ -429,6 +500,146 @@ fn shape_segment(
      Ok(())
  }
 
@@ -470,48 +470,62 @@ index f1ad855..06ea0e4 100644
 +    shape: &mut impl FnMut(Range<usize>, u32, &mut Vec<RawGlyph>),
 +) {
 +    let text_of = |piece: &Piece| &run_text[piece.bytes.clone()];
-+    let mut previous_start = 0;
-+    let mut i = 0;
-+    while i < pieces.len() {
-+        if let Some(cached) = words.get(text_of(&pieces[i])) {
-+            let base = pieces[i].chars.start;
-+            previous_start = glyphs.len();
-+            glyphs.extend(cached.iter().map(|g| RawGlyph {
-+                cluster: g.cluster + base,
-+                ..*g
++    // Where the glyphs of the piece before the current one start.
++    let mut previous_piece_start = 0;
++    let mut piece_index = 0;
++    while piece_index < pieces.len() {
++        if let Some(cached) = words.get(text_of(&pieces[piece_index])) {
++            let base = pieces[piece_index].chars.start;
++            previous_piece_start = glyphs.len();
++            glyphs.extend(cached.iter().map(|glyph| RawGlyph {
++                cluster: glyph.cluster + base,
++                ..*glyph
 +            }));
-+            i += 1;
++            piece_index += 1;
 +            continue;
 +        }
-+        let mut end = i + 1;
-+        while end < pieces.len() && words.get(text_of(&pieces[end])).is_none() {
-+            end += 1;
++
++        // The unseen pieces up to the next seen one, then one seen piece on each side.
++        let mut unseen_end = piece_index + 1;
++        while unseen_end < pieces.len() && words.get(text_of(&pieces[unseen_end])).is_none() {
++            unseen_end += 1;
 +        }
-+        let first = if i > 0 {
-+            glyphs.truncate(previous_start);
-+            i - 1
++        let span_start = if piece_index > 0 {
++            // Reshape the preceding piece's cached glyphs with the span.
++            glyphs.truncate(previous_piece_start);
++            piece_index - 1
 +        } else {
-+            i
++            piece_index
 +        };
-+        let end = (end + 1).min(pieces.len());
-+        let span = &pieces[first..end];
++        let span_end = (unseen_end + 1).min(pieces.len());
++        let span = &pieces[span_start..span_end];
++        let last = &span[span.len() - 1];
++
 +        let first_glyph = glyphs.len();
 +        shape(
-+            run_start + span[0].bytes.start..run_start + span[span.len() - 1].bytes.end,
++            run_start + span[0].bytes.start..run_start + last.bytes.end,
 +            span[0].chars.start,
 +            glyphs,
 +        );
 +        remember_pieces(run_text, span, &glyphs[first_glyph..], sensitive, words);
-+        previous_start = glyphs.len()
-+            - glyphs[first_glyph..]
-+                .iter()
-+                .rev()
-+                .take_while(|g| g.cluster >= span[span.len() - 1].chars.start)
-+                .count();
-+        i = end;
++
++        let reshaped = &glyphs[first_glyph..];
++        previous_piece_start = first_glyph + last_piece_start(reshaped, last.chars.start);
++        piece_index = span_end;
 +    }
 +}
 +
++/// Where the glyphs of the piece whose characters start at `chars_start` begin in `glyphs`.
++fn last_piece_start(glyphs: &[RawGlyph], chars_start: u32) -> usize {
++    let last_piece_glyphs = glyphs
++        .iter()
++        .rev()
++        .take_while(|glyph| glyph.cluster >= chars_start)
++        .count();
++    glyphs.len() - last_piece_glyphs
++}
++
++/// Remember the glyphs of each piece of `span`, whose clusters count from its first character.
 +fn remember_pieces(
 +    run_text: &str,
 +    span: &[Piece],
@@ -523,32 +537,35 @@ index f1ad855..06ea0e4 100644
 +    // first glyph does not start its first character shares a cluster with its neighbour, which
 +    // the font check should rule out: then nothing in the span is remembered.
 +    let mut bounds = Vec::with_capacity(span.len());
-+    let mut start = 0;
++    let mut piece_start = 0;
 +    for piece in span {
-+        let end = start + glyphs[start..].partition_point(|g| g.cluster < piece.chars.end);
-+        if end == start || glyphs[start].cluster != piece.chars.start {
++        let piece_end =
++            piece_start + glyphs[piece_start..].partition_point(|g| g.cluster < piece.chars.end);
++        if piece_end == piece_start || glyphs[piece_start].cluster != piece.chars.start {
 +            return;
 +        }
-+        bounds.push(start..end);
-+        start = end;
++        bounds.push(piece_start..piece_end);
++        piece_start = piece_end;
 +    }
-+    if start != glyphs.len() {
++    if piece_start != glyphs.len() {
 +        return;
 +    }
++
 +    for (piece, range) in span.iter().zip(bounds) {
 +        let word = &run_text[piece.bytes.clone()];
-+        let edges = [glyphs[range.start].id, glyphs[range.end - 1].id];
-+        if word.len() > word_cache::MAX_WORD_BYTES || edges.iter().any(|g| sensitive.contains(g)) {
++        let edge_glyphs = [glyphs[range.start].id, glyphs[range.end - 1].id];
++        let space_sensitive = edge_glyphs.iter().any(|glyph| sensitive.contains(glyph));
++        if word.len() > word_cache::MAX_WORD_BYTES || space_sensitive {
 +            continue;
 +        }
-+        let relative: Vec<RawGlyph> = glyphs[range]
++        let word_glyphs: Vec<RawGlyph> = glyphs[range]
 +            .iter()
-+            .map(|g| RawGlyph {
-+                cluster: g.cluster - piece.chars.start,
-+                ..*g
++            .map(|glyph| RawGlyph {
++                cluster: glyph.cluster - piece.chars.start,
++                ..*glyph
 +            })
 +            .collect();
-+        words.insert(word, &relative);
++        words.insert(word, &word_glyphs);
 +    }
 +}
 +
@@ -557,10 +574,10 @@ index f1ad855..06ea0e4 100644
      synthesis: &'a fontique::Synthesis,
 diff --git a/src/shape/word_cache.rs b/src/shape/word_cache.rs
 new file mode 100644
-index 0000000..43da49f
+index 0000000..76d50dc
 --- /dev/null
 +++ b/src/shape/word_cache.rs
-@@ -0,0 +1,505 @@
+@@ -0,0 +1,545 @@
 +// Copyright 2026 the Parley Authors
 +// SPDX-License-Identifier: Apache-2.0 OR MIT
 +
@@ -582,7 +599,10 @@ index 0000000..43da49f
 +    tables::{
 +        gpos::{PairPos, PositionSubtables, SinglePos},
 +        gsub::{SingleSubst, SubstitutionSubtables},
-+        layout::{ChainedSequenceContext, ClassDef, CoverageTable, LookupFlag, SequenceContext},
++        layout::{
++            ChainedSequenceContext, ChainedSequenceContextFormat1, ChainedSequenceContextFormat2,
++            ChainedSequenceContextFormat3, ClassDef, CoverageTable, LookupFlag, SequenceContext,
++        },
 +    },
 +    types::{BigEndian, GlyphId, GlyphId16, Tag},
 +};
@@ -751,145 +771,182 @@ index 0000000..43da49f
 +    /// lookahead, adding the glyphs from the space up to and including its input. A rule that
 +    /// reads past the space would see the neighbouring word.
 +    fn chain_allows(&mut self, context: &ChainedSequenceContext<'_>) -> Result<bool, ReadError> {
-+        let g = self.space;
 +        match context {
-+            ChainedSequenceContext::Format1(t) => {
-+                let coverage = t.coverage()?;
-+                if coverage.get(g).is_some() {
++            ChainedSequenceContext::Format1(t) => self.chain_allows_glyphs(t),
++            ChainedSequenceContext::Format2(t) => self.chain_allows_classes(t),
++            ChainedSequenceContext::Format3(t) => self.chain_allows_coverages(t),
++        }
++    }
++
++    /// [`Self::chain_allows`] for a context whose rules name glyphs.
++    fn chain_allows_glyphs(
++        &mut self,
++        t: &ChainedSequenceContextFormat1<'_>,
++    ) -> Result<bool, ReadError> {
++        let g = self.space;
++        let coverage = t.coverage()?;
++        if coverage.get(g).is_some() {
++            return Ok(false);
++        }
++        let is_space = is_glyph(g);
++        for (first, set) in coverage.iter().zip(t.chained_seq_rule_sets().iter()) {
++            let Some(set) = set else { continue };
++            for rule in set?.chained_seq_rules().iter() {
++                let rule = rule?;
++                let (backtrack, lookahead) = (rule.backtrack_sequence(), rule.lookahead_sequence());
++                if rule.input_sequence().iter().any(&is_space) {
 +                    return Ok(false);
 +                }
-+                let is_space = is_glyph(g);
-+                for (first, set) in coverage.iter().zip(t.chained_seq_rule_sets().iter()) {
-+                    let Some(set) = set else { continue };
-+                    for rule in set?.chained_seq_rules().iter() {
-+                        let rule = rule?;
-+                        let (backtrack, lookahead) =
-+                            (rule.backtrack_sequence(), rule.lookahead_sequence());
-+                        if rule.input_sequence().iter().any(&is_space) {
-+                            return Ok(false);
-+                        }
-+                        let (Some(b), Some(l)) = (
-+                            reach(backtrack.iter().map(&is_space)),
-+                            reach(lookahead.iter().map(&is_space)),
-+                        ) else {
-+                            return Ok(false);
-+                        };
-+                        if b.is_none() && l.is_none() {
-+                            continue;
-+                        }
-+                        let glyph = |g: &BigEndian<GlyphId16>| g.get().to_u32();
-+                        self.sensitive.insert(first.to_u32());
-+                        self.sensitive
-+                            .extend(rule.input_sequence().iter().map(glyph));
-+                        self.sensitive
-+                            .extend(backtrack[..b.unwrap_or(0)].iter().map(glyph));
-+                        self.sensitive
-+                            .extend(lookahead[..l.unwrap_or(0)].iter().map(glyph));
-+                    }
-+                }
-+                Ok(true)
-+            }
-+            ChainedSequenceContext::Format2(t) => {
-+                if covers(t.coverage(), g)? {
-+                    return Ok(false);
-+                }
-+                let space_class = [
-+                    class_of(t.backtrack_class_def(), g),
-+                    class_of(t.input_class_def(), g),
-+                    class_of(t.lookahead_class_def(), g),
-+                ];
-+                // The classes, per class definition, of the glyphs the rules reading the space move
-+                // or match between it and their input.
-+                let mut moved: [HashSet<u16>; 3] = Default::default();
-+                for (first_class, set) in t.chained_class_seq_rule_sets().iter().enumerate() {
-+                    let Some(set) = set else { continue };
-+                    for rule in set?.chained_class_seq_rules().iter() {
-+                        let rule = rule?;
-+                        let (backtrack, lookahead) =
-+                            (rule.backtrack_sequence(), rule.lookahead_sequence());
-+                        if rule
-+                            .input_sequence()
-+                            .iter()
-+                            .any(|c| c.get() == space_class[1])
-+                        {
-+                            return Ok(false);
-+                        }
-+                        let (Some(b), Some(l)) = (
-+                            reach(backtrack.iter().map(|c| c.get() == space_class[0])),
-+                            reach(lookahead.iter().map(|c| c.get() == space_class[2])),
-+                        ) else {
-+                            return Ok(false);
-+                        };
-+                        if b.is_none() && l.is_none() {
-+                            continue;
-+                        }
-+                        #[expect(
-+                            clippy::cast_possible_truncation,
-+                            reason = "class set counts are u16"
-+                        )]
-+                        moved[1].insert(first_class as u16);
-+                        moved[1].extend(rule.input_sequence().iter().map(|c| c.get()));
-+                        moved[0].extend(backtrack[..b.unwrap_or(0)].iter().map(|c| c.get()));
-+                        moved[2].extend(lookahead[..l.unwrap_or(0)].iter().map(|c| c.get()));
-+                    }
-+                }
-+                let class_defs = [
-+                    t.backtrack_class_def(),
-+                    t.input_class_def(),
-+                    t.lookahead_class_def(),
-+                ];
-+                for (moved, class_def) in moved.iter().zip(class_defs) {
-+                    if moved.is_empty() {
-+                        continue;
-+                    }
-+                    if moved.contains(&0) {
-+                        // Class 0 is every glyph its class definition leaves out.
-+                        return Ok(false);
-+                    }
-+                    for (glyph, class) in class_def?.iter() {
-+                        if moved.contains(&class) {
-+                            self.sensitive.insert(glyph.to_u32());
-+                        }
-+                    }
-+                }
-+                Ok(true)
-+            }
-+            ChainedSequenceContext::Format3(t) => {
-+                if any(t.input_coverages().iter(), |c| covers(Ok(c), g))? {
-+                    return Ok(false);
-+                }
-+                let backtrack = t.backtrack_coverages();
-+                let lookahead = t.lookahead_coverages();
-+                let reads = |c: Result<CoverageTable<'_>, ReadError>| covers(c, g);
-+                let (Some(b), Some(l)) = (
-+                    reach(
-+                        backtrack
-+                            .iter()
-+                            .map(reads)
-+                            .collect::<Result<Vec<_>, _>>()?
-+                            .into_iter(),
-+                    ),
-+                    reach(
-+                        lookahead
-+                            .iter()
-+                            .map(reads)
-+                            .collect::<Result<Vec<_>, _>>()?
-+                            .into_iter(),
-+                    ),
++                let (Some(backtrack_at), Some(lookahead_at)) = (
++                    reach(backtrack.iter().map(&is_space)),
++                    reach(lookahead.iter().map(&is_space)),
 +                ) else {
 +                    return Ok(false);
 +                };
-+                if b.is_none() && l.is_none() {
-+                    return Ok(true);
++                if backtrack_at.is_none() && lookahead_at.is_none() {
++                    continue;
 +                }
-+                let between = backtrack.iter().take(b.unwrap_or(0));
-+                let ahead = lookahead.iter().take(l.unwrap_or(0));
-+                for coverage in t.input_coverages().iter().chain(between).chain(ahead) {
-+                    self.sensitive.extend(coverage?.iter().map(|g| g.to_u32()));
-+                }
-+                Ok(true)
++                let glyph = |g: &BigEndian<GlyphId16>| g.get().to_u32();
++                self.sensitive.insert(first.to_u32());
++                self.sensitive
++                    .extend(rule.input_sequence().iter().map(glyph));
++                self.sensitive
++                    .extend(backtrack[..backtrack_at.unwrap_or(0)].iter().map(glyph));
++                self.sensitive
++                    .extend(lookahead[..lookahead_at.unwrap_or(0)].iter().map(glyph));
 +            }
 +        }
++        Ok(true)
++    }
++
++    /// [`Self::chain_allows`] for a context whose rules name glyph classes.
++    fn chain_allows_classes(
++        &mut self,
++        t: &ChainedSequenceContextFormat2<'_>,
++    ) -> Result<bool, ReadError> {
++        let g = self.space;
++        if covers(t.coverage(), g)? {
++            return Ok(false);
++        }
++        let space_class = [
++            class_of(t.backtrack_class_def(), g),
++            class_of(t.input_class_def(), g),
++            class_of(t.lookahead_class_def(), g),
++        ];
++
++        // The classes, per class definition, of the glyphs the rules reading the space move or
++        // match between it and their input.
++        let mut moved_classes: [HashSet<u16>; 3] = Default::default();
++        for (rule_set_class, set) in t.chained_class_seq_rule_sets().iter().enumerate() {
++            let Some(set) = set else { continue };
++            for rule in set?.chained_class_seq_rules().iter() {
++                let rule = rule?;
++                let (backtrack, lookahead) = (rule.backtrack_sequence(), rule.lookahead_sequence());
++                if rule
++                    .input_sequence()
++                    .iter()
++                    .any(|c| c.get() == space_class[1])
++                {
++                    return Ok(false);
++                }
++                let (Some(backtrack_at), Some(lookahead_at)) = (
++                    reach(backtrack.iter().map(|c| c.get() == space_class[0])),
++                    reach(lookahead.iter().map(|c| c.get() == space_class[2])),
++                ) else {
++                    return Ok(false);
++                };
++                if backtrack_at.is_none() && lookahead_at.is_none() {
++                    continue;
++                }
++                #[expect(clippy::cast_possible_truncation, reason = "class set counts are u16")]
++                moved_classes[1].insert(rule_set_class as u16);
++                moved_classes[1].extend(rule.input_sequence().iter().map(|c| c.get()));
++                moved_classes[0].extend(
++                    backtrack[..backtrack_at.unwrap_or(0)]
++                        .iter()
++                        .map(|c| c.get()),
++                );
++                moved_classes[2].extend(
++                    lookahead[..lookahead_at.unwrap_or(0)]
++                        .iter()
++                        .map(|c| c.get()),
++                );
++            }
++        }
++
++        let class_defs = [
++            t.backtrack_class_def(),
++            t.input_class_def(),
++            t.lookahead_class_def(),
++        ];
++        for (classes, class_def) in moved_classes.iter().zip(class_defs) {
++            if !self.mark_class_glyphs(classes, class_def)? {
++                return Ok(false);
++            }
++        }
++        Ok(true)
++    }
++
++    /// Mark the glyphs of `class_def` in any of `classes` as space-sensitive.
++    fn mark_class_glyphs(
++        &mut self,
++        classes: &HashSet<u16>,
++        class_def: Result<ClassDef<'_>, ReadError>,
++    ) -> Result<bool, ReadError> {
++        if classes.is_empty() {
++            return Ok(true);
++        }
++        if classes.contains(&0) {
++            // Class 0 is every glyph its class definition leaves out.
++            return Ok(false);
++        }
++        for (glyph, class) in class_def?.iter() {
++            if classes.contains(&class) {
++                self.sensitive.insert(glyph.to_u32());
++            }
++        }
++        Ok(true)
++    }
++
++    /// [`Self::chain_allows`] for a context whose rules name coverages.
++    fn chain_allows_coverages(
++        &mut self,
++        t: &ChainedSequenceContextFormat3<'_>,
++    ) -> Result<bool, ReadError> {
++        let g = self.space;
++        if any(t.input_coverages().iter(), |c| covers(Ok(c), g))? {
++            return Ok(false);
++        }
++        let backtrack = t.backtrack_coverages();
++        let lookahead = t.lookahead_coverages();
++        let reads = |c: Result<CoverageTable<'_>, ReadError>| covers(c, g);
++        let (Some(backtrack_at), Some(lookahead_at)) = (
++            reach(
++                backtrack
++                    .iter()
++                    .map(reads)
++                    .collect::<Result<Vec<_>, _>>()?
++                    .into_iter(),
++            ),
++            reach(
++                lookahead
++                    .iter()
++                    .map(reads)
++                    .collect::<Result<Vec<_>, _>>()?
++                    .into_iter(),
++            ),
++        ) else {
++            return Ok(false);
++        };
++        if backtrack_at.is_none() && lookahead_at.is_none() {
++            return Ok(true);
++        }
++        let between = backtrack.iter().take(backtrack_at.unwrap_or(0));
++        let ahead = lookahead.iter().take(lookahead_at.unwrap_or(0));
++        for coverage in t.input_coverages().iter().chain(between).chain(ahead) {
++            self.sensitive.extend(coverage?.iter().map(|g| g.to_u32()));
++        }
++        Ok(true)
 +    }
 +}
 +

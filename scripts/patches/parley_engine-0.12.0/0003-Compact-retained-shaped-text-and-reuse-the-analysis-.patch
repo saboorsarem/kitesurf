@@ -17,10 +17,10 @@ paragraph.
  Cargo.toml               |   4 +
  src/analysis.rs          |   6 +-
  src/analyzer.rs          |   3 +
- src/shape/atom.rs        | 250 ++++++++++++++----------
- src/shape/data.rs        | 413 ++++++++++++++++++++++++++++++++++-----
+ src/shape/atom.rs        | 250 +++++++++++++----------
+ src/shape/data.rs        | 415 ++++++++++++++++++++++++++++++++++-----
  src/shape/shaped_text.rs | 146 ++++++++++----
- 6 files changed, 629 insertions(+), 193 deletions(-)
+ 6 files changed, 631 insertions(+), 193 deletions(-)
 
 diff --git a/Cargo.toml b/Cargo.toml
 index 041dd9d..82f700b 100644
@@ -524,7 +524,7 @@ index fda89d7..699eef1 100644
              self.partial_advance = self.slice.partial_advance_at(self.cluster_idx);
          }
 diff --git a/src/shape/data.rs b/src/shape/data.rs
-index 6d760b7..2d42511 100644
+index 6d760b7..9d4946f 100644
 --- a/src/shape/data.rs
 +++ b/src/shape/data.rs
 @@ -5,37 +5,42 @@
@@ -642,7 +642,7 @@ index 6d760b7..2d42511 100644
      /// cached here so that measuring text does not need to touch the character array.
      #[inline(always)]
      pub fn is_soft_wrap_opportunity_before(self) -> bool {
-@@ -232,22 +225,223 @@ impl ShapedCluster {
+@@ -232,22 +225,225 @@ impl ShapedCluster {
      pub fn whitespace(self) -> Whitespace {
          self.flags.whitespace()
      }
@@ -798,21 +798,23 @@ index 6d760b7..2d42511 100644
 +        byte_start: u32,
 +    ) {
 +        let index = characters.len();
-+        let len = character.flags.len_utf8() as u32;
++        let len_utf8 = character.flags.len_utf8() as u32;
 +        if index == 0 {
 +            self.first_char_byte = byte_start;
 +        } else if self.char_mode != CharBytes::Dense && byte_start != self.text_byte_end {
 +            self.densify_chars(characters);
 +        }
-+        if self.char_mode == CharBytes::OneByte && len != 1 {
++        if self.char_mode == CharBytes::OneByte && len_utf8 != 1 {
 +            self.checkpoint_chars(index);
 +        }
++        // A sparse index stores every `CHAR_BLOCK`th character's offset; the first is inline.
++        let stores_checkpoint = index != 0 && index % CHAR_BLOCK == 0;
 +        match self.char_mode {
 +            CharBytes::OneByte => {}
-+            CharBytes::Sparse if index == 0 || index % CHAR_BLOCK != 0 => {}
++            CharBytes::Sparse if !stores_checkpoint => {}
 +            CharBytes::Sparse | CharBytes::Dense => self.char_bytes.push(byte_start),
 +        }
-+        self.text_byte_end = byte_start + len;
++        self.text_byte_end = byte_start + len_utf8;
 +        characters.push(character);
 +    }
 +
@@ -877,7 +879,7 @@ index 6d760b7..2d42511 100644
      }
  }
 
-@@ -266,6 +460,9 @@ impl CharacterFlags {
+@@ -266,6 +462,9 @@ impl CharacterFlags {
      const WORD_BOUNDARY: u8 = 1 << 3;
      /// Whether there is a soft wrap opportunity before the character.
      const SOFT_WRAP_OPPORTUNITY: u8 = 1 << 4;
@@ -887,7 +889,7 @@ index 6d760b7..2d42511 100644
 
      #[inline(always)]
      pub fn new(source_char: char, is_word_boundary: bool, is_soft_wrap_opportunity: bool) -> Self {
-@@ -314,6 +511,23 @@ impl CharacterFlags {
+@@ -314,6 +513,23 @@ impl CharacterFlags {
          self.0 & Self::EMOJI != 0
      }
 
@@ -911,7 +913,7 @@ index 6d760b7..2d42511 100644
      /// Returns the number of bytes the source character would need if encoded in UTF-8.
      ///
      /// That number of bytes is always between 1 and 4, inclusive.
-@@ -355,13 +569,116 @@ mod tests {
+@@ -355,13 +571,116 @@ mod tests {
              }
 
              let character = Character {
