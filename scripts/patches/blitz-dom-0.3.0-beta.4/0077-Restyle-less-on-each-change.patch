@@ -25,18 +25,18 @@ name still reshapes everything. The damage is applied at the next resolve rather
 than on each delivery, so a page that receives N faces walks its nodes once instead
 of N times.
 ---
- src/document.rs       | 36 +++++++++++++++++--
- src/layout/damage.rs  | 83 ++++++++++++++++++++++++++++++++++++++++++
- src/mutator.rs        | 84 +++++++++++++++++++++++++++++++++++++++----
- src/node/node.rs      | 25 ++++++++++---
- src/query_selector.rs | 51 +++++++++++++++++++++++++-
- src/resolve.rs        | 30 ++++++++++++++++
- src/stylo.rs          | 79 +++++++++++++++++++++++++++++-----------
- src/url.rs            |  4 +++
- 8 files changed, 358 insertions(+), 34 deletions(-)
+ src/document.rs       |  35 ++++++++++++++-
+ src/layout/damage.rs  | 102 ++++++++++++++++++++++++++++++++++++++++++
+ src/mutator.rs        |  91 ++++++++++++++++++++++++++++++++++---
+ src/node/node.rs      |  25 +++++++++--
+ src/query_selector.rs |  51 ++++++++++++++++++++-
+ src/resolve.rs        |  38 ++++++++++++++++
+ src/stylo.rs          |  81 ++++++++++++++++++++++++---------
+ src/url.rs            |   4 ++
+ 8 files changed, 393 insertions(+), 34 deletions(-)
 
 diff --git a/src/document.rs b/src/document.rs
-index 5f57b00..8d4090d 100644
+index 5f57b00..cba787d 100644
 --- a/src/document.rs
 +++ b/src/document.rs
 @@ -301,6 +301,17 @@ pub struct BaseDocument {
@@ -69,7 +69,7 @@ index 5f57b00..8d4090d 100644
              author_sheet_cache: HashMap::new(),
              pending_style_nodes: HashSet::new(),
              author_sheet_keys: HashMap::new(),
-@@ -2429,6 +2445,21 @@ impl BaseDocument {
+@@ -2429,6 +2445,20 @@ impl BaseDocument {
                          });
                      }
                  }
@@ -80,18 +80,17 @@ index 5f57b00..8d4090d 100644
 +                        names.push(name.to_lowercase());
 +                    }
 +                }
-+                let mut named = false;
++                // A face with no family name can change the shaping of any text.
++                self.stale_font_family_unknown |= names.is_empty();
 +                for name in names {
-+                    named = true;
 +                    if !self.stale_font_families.contains(&name) {
 +                        self.stale_font_families.push(name);
 +                    }
 +                }
-+                self.stale_font_family_unknown |= !named;
 
                  #[cfg(feature = "parallel-construct")]
                  {
-@@ -2444,8 +2475,9 @@ impl BaseDocument {
+@@ -2444,8 +2474,9 @@ impl BaseDocument {
                  }
                  drop(global_font_ctx);
 
@@ -104,10 +103,10 @@ index 5f57b00..8d4090d 100644
              Resource::None => {
                  // Do nothing
 diff --git a/src/layout/damage.rs b/src/layout/damage.rs
-index eb33360..9cf944d 100644
+index eb33360..e477e2c 100644
 --- a/src/layout/damage.rs
 +++ b/src/layout/damage.rs
-@@ -604,6 +604,89 @@ pub(crate) fn sort_layout_children_by_order(
+@@ -604,6 +604,108 @@ pub(crate) fn sort_layout_children_by_order(
  }
 
  impl BaseDocument {
@@ -116,8 +115,19 @@ index eb33360..9cf944d 100644
 +    /// damages the inline root holding its text and every inline root above it, since an
 +    /// inline-block that reshapes resizes the lines around it.
 +    pub(crate) fn invalidate_inline_contexts_using(&mut self, families: &[String]) {
-+        if families.is_empty() {
++        let matched = self.nodes_naming_font_family(families);
++        if matched.is_empty() {
 +            return;
++        }
++        let (roots, inputs) = self.inline_roots_above(&matched);
++        self.damage_inline_roots(&roots);
++        self.refresh_text_inputs(&inputs);
++    }
++
++    /// The connected nodes whose `font-family` names one of `families` (lowercased).
++    fn nodes_naming_font_family(&self, families: &[String]) -> Vec<NodeId> {
++        if families.is_empty() {
++            return Vec::new();
 +        }
 +        let names_family = |node: &Node| {
 +            let Some(styles) = node.primary_styles() else {
@@ -138,22 +148,21 @@ index eb33360..9cf944d 100644
 +                style::values::computed::font::SingleFontFamily::Generic(_) => false,
 +            })
 +        };
-+        let matched: Vec<NodeId> = self
-+            .nodes
++        self.nodes
 +            .iter()
 +            .filter(|(_, node)| node.flags.contains(NodeFlags::IS_IN_DOCUMENT))
 +            .filter(|(_, node)| node.element_data().is_some() && names_family(node))
 +            .map(|(id, _)| id)
-+            .collect();
-+        if matched.is_empty() {
-+            return;
-+        }
++            .collect()
++    }
 +
-+        let scale = self.viewport.scale();
++    /// The inline roots holding text of each node in `starts` and those above them, plus the
++    /// text inputs among `starts`.
++    fn inline_roots_above(&self, starts: &[NodeId]) -> (Vec<NodeId>, Vec<NodeId>) {
 +        let mut visited = std::collections::HashSet::new();
 +        let mut roots = Vec::new();
 +        let mut inputs = Vec::new();
-+        for start in matched {
++        for &start in starts {
 +            if self.nodes[start].element_data().is_some_and(|e| e.text_input_data().is_some()) {
 +                inputs.push(start);
 +            }
@@ -169,8 +178,12 @@ index eb33360..9cf944d 100644
 +                at = node.layout_parent.get().or(node.parent.get());
 +            }
 +        }
++        (roots, inputs)
++    }
 +
-+        for id in roots {
++    /// Damages each inline root, and the block that re-collects an anonymous one.
++    fn damage_inline_roots(&mut self, roots: &[NodeId]) {
++        for &id in roots {
 +            let node = &mut self.nodes[id];
 +            node.insert_damage(ALL_DAMAGE);
 +            if node.is_anonymous() {
@@ -179,9 +192,14 @@ index eb33360..9cf944d 100644
 +                }
 +            }
 +        }
++    }
++
++    /// Reshapes the editor of each text input against the newly registered faces.
++    fn refresh_text_inputs(&mut self, inputs: &[NodeId]) {
++        let scale = self.viewport.scale();
 +        let font_ctx = &self.font_ctx;
 +        let layout_ctx = &mut self.layout_ctx;
-+        for id in inputs {
++        for &id in inputs {
 +            let node = &mut self.nodes[id];
 +            if let Some(input) =
 +                node.data.downcast_element_mut().and_then(|e| e.text_input_data_mut())
@@ -198,7 +216,7 @@ index eb33360..9cf944d 100644
          let scale = self.viewport.scale();
 
 diff --git a/src/mutator.rs b/src/mutator.rs
-index a85e9ab..3f042ee 100644
+index eb3701e..68a29ab 100644
 --- a/src/mutator.rs
 +++ b/src/mutator.rs
 @@ -20,6 +20,23 @@ use thin_vec::ThinVec;
@@ -263,7 +281,7 @@ index a85e9ab..3f042ee 100644
              for &child_id in child_ids.iter() {
                  self.doc.invalidate_relative_selectors_for_insertion(child_id);
              }
-@@ -1025,6 +1050,53 @@ impl DocumentMutator<'_> {
+@@ -1025,6 +1050,60 @@ impl DocumentMutator<'_> {
          self.maybe_record_node(parent_id);
      }
 
@@ -279,26 +297,15 @@ index a85e9ab..3f042ee 100644
 +        let flags = self.doc.nodes[parent_id].selector_flags().get();
 +        let later_siblings = flags.contains(ElementSelectorFlags::HAS_SLOW_SELECTOR_LATER_SIBLINGS);
 +        let edge_children = flags.contains(ElementSelectorFlags::HAS_EDGE_CHILD_SELECTOR);
-+        if !later_siblings && !edge_children {
++        if child_ids.is_empty() || (!later_siblings && !edge_children) {
 +            return;
 +        }
-+        let (Some(&first_id), Some(&last_id)) = (child_ids.first(), child_ids.last()) else {
-+            return;
-+        };
-+        let children = &self.doc.nodes[parent_id].children;
-+        // Callers splice `child_ids` in as one contiguous run; anything else restyles it all.
-+        let first = if children.last() == Some(&last_id) {
-+            children.len().checked_sub(child_ids.len())
-+        } else {
-+            children.iter().position(|id| *id == first_id)
-+        };
-+        let first = first.filter(|&f| children.get(f) == Some(&first_id));
-+        let last = first.map(|first| first + child_ids.len() - 1);
-+        let (Some(first), Some(last)) = (first, last.filter(|&l| children.get(l) == Some(&last_id)))
-+        else {
++        let Some((first, last)) = self.spliced_run(parent_id, child_ids) else {
 +            self.doc.nodes[parent_id].set_restyle_hint(RestyleHint::restyle_subtree());
 +            return;
 +        };
++
++        let children = &self.doc.nodes[parent_id].children;
 +        let is_element = |id: &&NodeId| self.doc.nodes[**id].is_element();
 +        let mut targets: Vec<NodeId> = Vec::new();
 +        if edge_children {
@@ -314,11 +321,29 @@ index a85e9ab..3f042ee 100644
 +        }
 +    }
 +
++    /// The `first..=last` range `child_ids` occupies in `parent_id`'s child list, or `None` when
++    /// they are not one contiguous run there. Callers splice them in as a run.
++    fn spliced_run(&self, parent_id: NodeId, child_ids: &[NodeId]) -> Option<(usize, usize)> {
++        let first_id = *child_ids.first()?;
++        let last_id = *child_ids.last()?;
++        let children = &self.doc.nodes[parent_id].children;
++        let first = if children.last() == Some(&last_id) {
++            children.len().checked_sub(child_ids.len())?
++        } else {
++            children.iter().position(|id| *id == first_id)?
++        };
++        if children.get(first) != Some(&first_id) {
++            return None;
++        }
++        let last = first + child_ids.len() - 1;
++        (children.get(last) == Some(&last_id)).then_some((first, last))
++    }
++
      // Tree mutation methods (that defer to other methods)
      pub fn insert_nodes_after(&mut self, anchor_node_id: NodeId, new_node_ids: &[NodeId]) {
          match self.next_sibling_id(anchor_node_id) {
 diff --git a/src/node/node.rs b/src/node/node.rs
-index fd4891b..2f3cda0 100644
+index 27490a3..c48559d 100644
 --- a/src/node/node.rs
 +++ b/src/node/node.rs
 @@ -379,6 +379,15 @@ pub(crate) struct LayoutChildLists {
@@ -337,7 +362,7 @@ index fd4891b..2f3cda0 100644
  pub struct Node {
      // The actual tree we belong to. This is unsafe!!
      tree: *mut crate::NodeTree,
-@@ -1605,10 +1614,18 @@ impl Node {
+@@ -1597,10 +1606,18 @@ impl Node {
 
      // Get the index of the current node in the parents child list
      pub fn child_index(&self) -> Option<usize> {
@@ -361,17 +386,17 @@ index fd4891b..2f3cda0 100644
 
      // Get the nth node in the parents child list
 diff --git a/src/query_selector.rs b/src/query_selector.rs
-index a721eb4..aa38612 100644
+index e8b3865..8e4077c 100644
 --- a/src/query_selector.rs
 +++ b/src/query_selector.rs
 @@ -1,5 +1,6 @@
  use blitz_traits::node_id::NodeId;
  use selectors::SelectorList;
 +use std::collections::HashMap;
+ use std::collections::hash_map::Entry;
  use smallvec::SmallVec;
  use style::dom::{TDocument, TNode};
- use style::dom_apis::{
-@@ -8,8 +9,51 @@ use style::dom_apis::{
+@@ -9,8 +10,51 @@ use style::dom_apis::{
  use style::selector_parser::{SelectorImpl, SelectorParser};
  use style_traits::ParseError;
 
@@ -423,7 +448,7 @@ index a721eb4..aa38612 100644
  impl BaseDocument {
      /// Find the node with the specified id attribute (if one exists).
      /// If multiple nodes have the same id, the first in tree order is returned.
-@@ -247,8 +291,13 @@ impl BaseDocument {
+@@ -248,8 +292,13 @@ impl BaseDocument {
          &self,
          input: &str,
      ) -> Result<SelectorList<SelectorImpl>, ParseError> {
@@ -439,10 +464,10 @@ index a721eb4..aa38612 100644
 
      // Namespace-aware variant for CSSOM selectorText writes: a rule in a
 diff --git a/src/resolve.rs b/src/resolve.rs
-index a7c33ff..c4a0628 100644
+index a7c33ff..f36b249 100644
 --- a/src/resolve.rs
 +++ b/src/resolve.rs
-@@ -129,6 +129,27 @@ impl BaseDocument {
+@@ -129,6 +129,42 @@ impl BaseDocument {
          }
      }
 
@@ -467,25 +492,33 @@ index a7c33ff..c4a0628 100644
 +        !self.size_container_seen
 +    }
 +
++    /// Reshape the inline contexts that web-font faces registered since the last resolve can
++    /// change. Deferred to here because the damage is only read in a resolve, and a page
++    /// receiving N faces would otherwise walk every node N times.
++    fn apply_pending_font_damage(&mut self) {
++        if !std::mem::take(&mut self.inline_contexts_stale) {
++            return;
++        }
++        let families = std::mem::take(&mut self.stale_font_families);
++        if std::mem::take(&mut self.stale_font_family_unknown) {
++            self.invalidate_inline_contexts();
++        } else {
++            self.invalidate_inline_contexts_using(&families);
++        }
++    }
++
      /// Restyle the tree and then relayout it
      pub fn resolve(&mut self, current_time_for_animations: f64) {
          if TDocument::as_node(&self.root_node())
-@@ -174,6 +195,14 @@ impl BaseDocument {
+@@ -174,6 +210,7 @@ impl BaseDocument {
          // Apply any device changes (viewport resize, zoom, color-scheme, etc)
          // accumulated since the last resolve as a single device rebuild.
          self.flush_pending_device_changes();
-+        if std::mem::take(&mut self.inline_contexts_stale) {
-+            let families = std::mem::take(&mut self.stale_font_families);
-+            if std::mem::take(&mut self.stale_font_family_unknown) {
-+                self.invalidate_inline_contexts();
-+            } else {
-+                self.invalidate_inline_contexts_using(&families);
-+            }
-+        }
++        self.apply_pending_font_damage();
          // Slot assignment shapes the flat tree that styling and box
          // construction both consume; recompute before either runs.
          self.flush_slot_assignments();
-@@ -202,6 +231,7 @@ impl BaseDocument {
+@@ -202,6 +239,7 @@ impl BaseDocument {
          // Snapshot the sizes it styles against, so the pass after layout can
          // spot the containers whose answer is now stale.
          let container_sizes_before = container_sizes(self);
@@ -494,7 +527,7 @@ index a7c33ff..c4a0628 100644
          // CSS counters: list-item values + counter()/attr() pseudo content.
          // Needs computed styles; box construction consumes the side tables.
 diff --git a/src/stylo.rs b/src/stylo.rs
-index 58b53cd..5f3103f 100644
+index 58b53cd..f55ffd9 100644
 --- a/src/stylo.rs
 +++ b/src/stylo.rs
 @@ -5,7 +5,7 @@ use blitz_traits::node_id::NodeId;
@@ -599,7 +632,7 @@ index 58b53cd..5f3103f 100644
  }
 
  impl<'a> RecalcStyle<'a> {
-@@ -1726,10 +1747,15 @@ impl<'a> RecalcStyle<'a> {
+@@ -1726,10 +1747,22 @@ impl<'a> RecalcStyle<'a> {
          RecalcStyle {
              context,
              nodes_needing_style_image_flush: Mutex::new(Vec::new()),
@@ -612,22 +645,24 @@ index 58b53cd..5f3103f 100644
 +    !style.get_box().clone_container_type().is_normal()
 +}
 +
++/// Whether this element or one of its eager pseudo-elements styles as a query container.
++fn styles_a_size_container(styles: &style::data::ElementStyles) -> bool {
++    let pseudos = styles.pseudos.as_optional_array();
++    styles.get_primary().is_some_and(|s| is_size_container_style(s))
++        || pseudos.is_some_and(|styles| styles.iter().flatten().any(|s| is_size_container_style(s)))
++}
++
  #[allow(unsafe_code)]
  impl<'dom> DomTraversal<BlitzNode<'dom>> for RecalcStyle<'_> {
      fn process_preorder<F: FnMut(BlitzNode<'dom>)>(
-@@ -1766,6 +1792,17 @@ impl<'dom> DomTraversal<BlitzNode<'dom>> for RecalcStyle<'_> {
+@@ -1766,6 +1799,12 @@ impl<'dom> DomTraversal<BlitzNode<'dom>> for RecalcStyle<'_> {
 
              sync_pseudo_element_styles(el, &data, &self.nodes_needing_style_image_flush);
 
-+            if !self.saw_size_container.load(Ordering::Relaxed) {
-+                let pseudos = data.styles.pseudos.as_optional_array();
-+                let container = data.styles.get_primary().is_some_and(|s| is_size_container_style(s))
-+                    || pseudos.is_some_and(|styles| {
-+                        styles.iter().flatten().any(|s| is_size_container_style(s))
-+                    });
-+                if container {
-+                    self.saw_size_container.store(true, Ordering::Relaxed);
-+                }
++            if !self.saw_size_container.load(Ordering::Relaxed)
++                && styles_a_size_container(&data.styles)
++            {
++                self.saw_size_container.store(true, Ordering::Relaxed);
 +            }
 +
              if !data.damage.is_empty() {

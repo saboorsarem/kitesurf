@@ -12,12 +12,12 @@ connected to the document tree, and remove them when a subtree leaves it, so mov
 cloning or re-inserting a shadow-tree element cannot make getElementById return a node
 from a shadow tree.
 ---
- src/mutator.rs | 51 +++++++++++++++++++++++++++++++++++++++++++++++++-
- src/util.rs    | 46 ++++++++++++++++++++++++++++++++++++++-------
- 2 files changed, 89 insertions(+), 8 deletions(-)
+ src/mutator.rs | 48 +++++++++++++++++++++++++++++++++++++++++++++++-
+ src/util.rs    | 46 +++++++++++++++++++++++++++++++++++++++-------
+ 2 files changed, 86 insertions(+), 8 deletions(-)
 
 diff --git a/src/mutator.rs b/src/mutator.rs
-index 060bc50..537c406 100644
+index 060bc50..868675f 100644
 --- a/src/mutator.rs
 +++ b/src/mutator.rs
 @@ -418,7 +418,11 @@ impl DocumentMutator<'_> {
@@ -68,35 +68,32 @@ index 060bc50..537c406 100644
 
          // Insertions invalidate after linking, since the collector
          // reads the node's final parent and sibling positions.
-@@ -1291,6 +1312,34 @@ impl<'doc> DocumentMutator<'doc> {
+@@ -1291,6 +1312,31 @@ impl<'doc> DocumentMutator<'doc> {
          self.eager_op_queue = ops;
      }
 
-+    /// Re-derives id map membership for a connected subtree whose shadow containment
-+    /// changed: only connected light-tree ids belong in the map, so template contents stay out.
-+    /// `in_shadow` is the root's containment; descendants derive theirs from the traversal
-+    /// parent, in iter_subtree_mut's order, so no id node walks its ancestors.
++    /// Re-derives id map membership for a connected subtree whose shadow containment changed:
++    /// only connected light-tree ids belong in the map. `in_shadow` is the root's containment;
++    /// each descendant derives its own from its traversal parent, so no id node walks its
++    /// ancestors.
 +    fn reindex_subtree_ids(&mut self, node_id: NodeId, in_shadow: bool) {
-+        reindex_subtree_ids_inner(self.doc, node_id, in_shadow);
-+        fn reindex_subtree_ids_inner(doc: &mut BaseDocument, node_id: NodeId, in_shadow: bool) {
-+            let node = &doc.nodes[node_id];
-+            if let Some(id_attr) = node.attr(local_name!("id")).map(ToString::to_string) {
-+                let indexed = node.flags.is_in_document() && !in_shadow;
-+                doc.remove_from_id_map(&id_attr, node_id);
-+                if indexed {
-+                    doc.add_to_id_map(&id_attr, node_id);
-+                }
++        let node = &self.doc.nodes[node_id];
++        if let Some(id_attr) = node.attr(local_name!("id")).map(ToString::to_string) {
++            let indexed = node.flags.is_in_document() && !in_shadow;
++            self.doc.remove_from_id_map(&id_attr, node_id);
++            if indexed {
++                self.doc.add_to_id_map(&id_attr, node_id);
 +            }
-+            // A shadow root's parent is its host, so it shares the host's containment.
-+            let node = &doc.nodes[node_id];
-+            let children_in_shadow = in_shadow || node.is_shadow_root();
-+            if let Some(shadow_root_id) = node.attached_shadow_root_id() {
-+                reindex_subtree_ids_inner(doc, shadow_root_id, in_shadow);
-+            }
-+            for index in 0..doc.nodes[node_id].children.len() {
-+                let child_id = doc.nodes[node_id].children[index];
-+                reindex_subtree_ids_inner(doc, child_id, children_in_shadow);
-+            }
++        }
++
++        // A shadow root's parent is its host, so it shares the host's containment.
++        let children_in_shadow = in_shadow || self.doc.nodes[node_id].is_shadow_root();
++        if let Some(shadow_root_id) = self.doc.nodes[node_id].attached_shadow_root_id() {
++            self.reindex_subtree_ids(shadow_root_id, in_shadow);
++        }
++        for index in 0..self.doc.nodes[node_id].children.len() {
++            let child_id = self.doc.nodes[node_id].children[index];
++            self.reindex_subtree_ids(child_id, children_in_shadow);
 +        }
 +    }
 +
