@@ -34,6 +34,9 @@ test("/ without inspector params, or with a non-http(s) url, serves the landing 
     expect(csp, path).toContain("form-action 'self'");
     const html = await res.text();
     expect(html, path).toContain('<form class="omnibox" action="/" method="get"');
+    expect(html, path).toContain('<select id="font-profile" name="ks_font_profile">');
+    expect(html, path).toContain('<option value="">Default fonts</option>');
+    expect(html, path).toContain('<option value="macos">Chrome on macOS (macos)</option>');
     expect(html, path).toContain(exampleHref("https://example.com/devtools", "wss", "ks.invalid"));
     expect(html, path).toContain("DevTools loads from <code>example.com</code>");
     expect(html, path).toContain("wss://ks.invalid/devtools/browser");

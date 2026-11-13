@@ -6,6 +6,7 @@
 // frontend, the CDP endpoints for agents and other clients, and the chrome://inspect steps.
 
 import { absoluteInspectorBaseUrl, inspectorTargetUrl } from "./inspector.ts";
+import { FONT_PROFILES, type FontProfile } from "./cdp/font-profile.ts";
 
 const README = "https://github.com/cloudflare/kitesurf#readme";
 
@@ -15,6 +16,11 @@ const EXAMPLES: ReadonlyArray<{ title: string; url: string }> = [
   { title: "The Cloudflare Blog", url: "https://blog.cloudflare.com/" },
   { title: "Browser Run docs", url: "https://developers.cloudflare.com/browser-run/" },
 ];
+
+const FONT_PROFILE_LABELS: Record<FontProfile, string> = {
+  noto: "Noto",
+  macos: "Chrome on macOS",
+};
 
 const HTML_ESCAPES: Record<string, string> = {
   "&": "&amp;",
@@ -34,7 +40,21 @@ function discoveryTarget(url: URL): string {
   return `${url.hostname}:${url.protocol === "https:" ? "443" : "80"}`;
 }
 
-// The form submits to `/?url=`, which redirects to the frontend; the examples link to it directly.
+// An empty value leaves the profile to the engine's KITESURF_FONT_PROFILE.
+function fontProfileSelect(): string {
+  const options = FONT_PROFILES.map(
+    (profile) =>
+      `<option value="${profile}">${escapeHtml(FONT_PROFILE_LABELS[profile])} (${profile})</option>`,
+  ).join("\n");
+  return `<label class="sr-only" for="font-profile">Font profile</label>
+<select id="font-profile" name="ks_font_profile">
+<option value="">Default fonts</option>
+${options}
+</select>`;
+}
+
+// The form submits to `/?url=`, which redirects to the frontend; the examples link to it directly
+// and use the default font profile.
 function inspectSection(url: URL, base: string): string {
   const examples = EXAMPLES.map(({ title, url: page }) => {
     const href = escapeHtml(inspectorTargetUrl(base, { url, host: url.host, initialUrl: page }));
@@ -51,6 +71,7 @@ function inspectSection(url: URL, base: string): string {
   return `<form class="omnibox" action="/" method="get" autocomplete="off">
 <label class="sr-only" for="inspect-url">Enter a URL to inspect</label>
 <input id="inspect-url" type="url" name="url" placeholder="Enter a URL to inspect" required spellcheck="false" autocapitalize="off">
+${fontProfileSelect()}
 <button type="submit">Inspect</button>
 </form>
 <p>Or open an example page in DevTools:</p>
@@ -117,6 +138,7 @@ dt { font-weight: 600; margin-top: 0.75rem; }
 dd { margin: 0.25rem 0 0; }
 .omnibox { display: flex; gap: 0.5rem; margin: 1.5rem 0; }
 .omnibox input { flex: 1; font: inherit; padding: 0.5rem 0.75rem; border: 1px solid #ccc; border-radius: 6px; }
+.omnibox select { font: inherit; padding: 0.5rem; border: 1px solid #ccc; border-radius: 6px; background: #fff; }
 .omnibox button { font: inherit; padding: 0.5rem 1rem; border: 0; border-radius: 6px; background: #f46021; color: #fff; cursor: pointer; }
 .examples { padding-left: 1.25rem; }
 .examples code { color: #555; font-size: 0.85em; }
